@@ -1,12 +1,11 @@
-"""Main 3.5-stage pipeline converter.
+"""Chunk-driven 2-tier pipeline converter.
 
-Stage 1 (TopDown):     LLM extracts macro ProcedureCard skeleton
-Stage 2 (CodeBased):   LLM translates ProcedureCard -> structured pseudocode
-Stage 2.5 (Merge):     LLM reconciles pseudocode with original document to
-                        capture every granular detail the skeleton may have missed
-Stage 3 (Graph Build): DETERMINISTIC walk of merged pseudocode -> WorkflowNodes
+Step 0 (Overview):       LLM extracts lightweight ProcedureOverview (goal, phases, gates)
+Step 1 (Per-Chunk):      LLM converts each enriched chunk -> Procedure with carryover
+Step 2 (Merge):          LLM reconciles assembled pseudocode with original SOP text
+Step 3 (Graph Build):    DETERMINISTIC walk of merged pseudocode -> WorkflowNodes
 
-The LLM's job ends after the merge. Stage 3 is pure compilation — no hallucination.
+The LLM's job ends after the merge. Step 3 is pure compilation — no hallucination.
 """
 
 import re
@@ -20,7 +19,7 @@ from sop_to_dag.schemas import (
     ActionStep,
     ConditionalBlock,
     Procedure,
-    ProcedureCard,
+    ProcedureOverview,
     PseudocodeBlock,
     StepItem,
 )
@@ -29,66 +28,71 @@ from sop_to_dag.schemas import (
 # Inline prompts
 # ---------------------------------------------------------------------------
 
-_TOP_DOWN_SYSTEM = """\
-You are a Senior Process Architect specializing in Standard Operating Procedures.
+_OVERVIEW_SYSTEM = """\
+You are a Senior Process Architect. Extract a LIGHTWEIGHT overview from the
+provided SOP text. This is NOT a full skeleton — just the global map.
 
-Your task is to extract a high-level macro-skeleton from the provided SOP text.
-Identify:
-1. The overarching GOAL of the procedure
-2. The MAJOR PHASES in sequential order
-3. All DECISION GATES (if/then branching points)
+Identify ONLY:
+1. The overarching GOAL of the procedure (one sentence)
+2. The ordered list of MAJOR PHASE / SECTION NAMES
+3. Any CROSS-PHASE DECISION GATES — decisions in one phase that affect the
+   flow in a later phase (e.g., "if fraud detected in intake, escalate in
+   resolution")
 
-For each phase, identify:
-- A clear name and description
-- Key decision points within the phase
-- Ordered sub-steps
-
-For each decision gate, identify:
-- The exact condition being evaluated
-- What happens when the condition is TRUE
-- What happens when the condition is FALSE
-
-Be exhaustive — capture every decision point and phase mentioned in the SOP.
-Do NOT invent steps that are not in the source text.
+Do NOT list sub-steps, do NOT enumerate every decision point.
+Keep the output minimal — it serves as a table of contents for downstream steps.
 """
 
-_TOP_DOWN_HUMAN = """\
-Extract the macro-skeleton from this SOP:
+_OVERVIEW_HUMAN = """\
+Extract a lightweight overview from this SOP:
 
 ---
 {source_text}
 ---
 
-Return a ProcedureCard with title, goal, major_phases, and decision_gates.
+Return a ProcedureOverview with goal, phase_names, and cross_phase_decisions.
 """
 
-_CODE_BASED_SYSTEM = """\
-You are a Process Logic Engineer. You translate structured procedure descriptions
-into precise pseudocode representations.
+_CHUNK_TO_PSEUDOCODE_SYSTEM = """\
+You are a Process Logic Engineer. You convert a SINGLE section/chunk of an SOP
+into a precise Procedure (structured pseudocode).
 
-Given a ProcedureCard (high-level skeleton) and the original SOP text, produce
-a PseudocodeBlock containing one or more Procedures.
+You receive:
+- An overview of the full SOP (goal, phase list, cross-phase decisions) for context
+- The enriched chunk text to convert
+- Cross-reference context retrieved for this chunk (may be empty)
+- The previous chunk's Procedure output (may be empty for the first chunk)
 
 Rules:
 1. Every sequential action becomes an ActionStep
 2. Every decision point becomes a ConditionalBlock with IF/ELSE branches
-3. Preserve the exact conditions from the source text — do not simplify or rephrase
-4. Each Procedure should have clear preconditions and postconditions
+3. Preserve the EXACT conditions from the source text — do not simplify or rephrase
+4. The Procedure should have clear preconditions and postconditions
 5. Nested conditionals are allowed (ConditionalBlock within ConditionalBlock)
 6. Cover ALL paths — every branch must lead somewhere
-7. Reference the original SOP text to ensure no steps are missed
+7. Use cross-reference context to resolve dangling references, but do NOT
+   invent steps that are not in the chunk text or its cross-references
+8. Ensure continuity with the previous chunk's output — if the prior procedure
+   ends with an action or branch that leads into this chunk, set appropriate
+   preconditions
 """
 
-_CODE_BASED_HUMAN = """\
-Convert this procedure skeleton into structured pseudocode.
+_CHUNK_TO_PSEUDOCODE_HUMAN = """\
+Convert this SOP chunk into a structured Procedure.
 
-## Procedure Card
-{procedure_card}
+## SOP Overview (global context)
+{overview}
 
-## Original SOP Text (for reference)
-{source_text}
+## Chunk Text
+{chunk_text}
 
-Return a PseudocodeBlock with all procedures, their steps, and conditions.
+## Cross-Reference Context
+{retrieved_context}
+
+## Previous Chunk's Procedure (for continuity)
+{prior_procedure}
+
+Return a single Procedure with name, preconditions, steps, and postconditions.
 """
 
 _MERGE_SYSTEM = """\
@@ -445,9 +449,9 @@ class _GraphBuilder:
 
 
 class PipelineConverter:
-    """3.5-stage converter: TopDown -> CodeBased -> Merge -> Deterministic Graph.
+    """Chunk-driven pipeline: Overview -> Per-Chunk Pseudocode -> Merge -> Graph.
 
-    Stages 1, 2, 2.5 use LLMs. Stage 3 is deterministic compilation.
+    Steps 0-2 use LLMs. Step 3 is deterministic compilation.
     """
 
     converter_id = "pipeline_3stage"
@@ -466,42 +470,53 @@ class PipelineConverter:
         Returns:
             Dict mapping node_id to node data dicts.
         """
-        # Build enrichment context if available
+        # Step 0: Lightweight overview extraction
+        overview: ProcedureOverview = _llm_extract(
+            stage="top_down",
+            system=_OVERVIEW_SYSTEM,
+            human=_OVERVIEW_HUMAN,
+            output_schema=ProcedureOverview,
+            source_text=source_text,
+        )
+
+        # Step 1: Sequential per-chunk pseudocode with carryover
+        procedures: List[Procedure] = []
+        prior_procedure_json = ""
+
+        chunks_to_process = enriched_chunks if enriched_chunks else [
+            {"chunk_id": 0, "chunk_text": source_text, "retrieved_context": ""}
+        ]
+
+        for ec in chunks_to_process:
+            procedure: Procedure = _llm_extract(
+                stage="code_based",
+                system=_CHUNK_TO_PSEUDOCODE_SYSTEM,
+                human=_CHUNK_TO_PSEUDOCODE_HUMAN,
+                output_schema=Procedure,
+                overview=overview.model_dump_json(indent=2),
+                chunk_text=ec["chunk_text"],
+                retrieved_context=ec.get("retrieved_context", ""),
+                prior_procedure=prior_procedure_json,
+            )
+            procedures.append(procedure)
+            prior_procedure_json = procedure.model_dump_json(indent=2)
+
+        pseudocode = PseudocodeBlock(procedures=procedures)
+
+        # Step 2: Merge with original SOP for granular detail guarantee
         enrichment_context = ""
         if enriched_chunks:
-            context_parts = []
-            for ec in enriched_chunks:
-                if ec.get("retrieved_context"):
-                    context_parts.append(
-                        f"## Context for Chunk {ec['chunk_id']}\n"
-                        f"{ec['retrieved_context']}"
-                    )
+            context_parts = [
+                f"## Context for Chunk {ec['chunk_id']}\n{ec['retrieved_context']}"
+                for ec in enriched_chunks
+                if ec.get("retrieved_context")
+            ]
             if context_parts:
                 enrichment_context = (
-                    "## Cross-Reference Context (from RAG enrichment)\n"
+                    "## Cross-Reference Context\n"
                     + "\n\n".join(context_parts)
                 )
 
-        # Stage 1: Raw text -> macro ProcedureCard skeleton
-        procedure_card: ProcedureCard = _llm_extract(
-            stage="top_down",
-            system=_TOP_DOWN_SYSTEM,
-            human=_TOP_DOWN_HUMAN,
-            output_schema=ProcedureCard,
-            source_text=source_text,
-        )
-
-        # Stage 2: ProcedureCard -> structured pseudocode
-        pseudocode: PseudocodeBlock = _llm_extract(
-            stage="code_based",
-            system=_CODE_BASED_SYSTEM,
-            human=_CODE_BASED_HUMAN,
-            output_schema=PseudocodeBlock,
-            procedure_card=procedure_card.model_dump_json(indent=2),
-            source_text=source_text,
-        )
-
-        # Stage 2.5: Merge pseudocode with original document for granularity
         merged_pseudocode: PseudocodeBlock = _llm_extract(
             stage="code_based",
             system=_MERGE_SYSTEM,
@@ -512,8 +527,6 @@ class PipelineConverter:
             enrichment_context=enrichment_context,
         )
 
-        # Stage 3: Deterministic compilation -> WorkflowNode graph
+        # Step 3: Deterministic compilation -> WorkflowNode graph
         builder = _GraphBuilder()
-        nodes = builder.build(merged_pseudocode)
-
-        return nodes
+        return builder.build(merged_pseudocode)

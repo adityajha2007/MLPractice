@@ -22,14 +22,14 @@ Raw SOP Text
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────┐
-│  CONVERTER (converter.py) — 3.5 Stages                  │
+│  CONVERTER (converter.py) — Chunk-Driven Pipeline       │
 │                                                         │
-│  Stage 1   [LLM]  Raw text → ProcedureCard              │
-│  Stage 2   [LLM]  ProcedureCard → PseudocodeBlock       │
-│  Stage 2.5 [LLM]  Merge pseudocode ↔ original doc       │
-│  Stage 3   [CODE] Deterministic compile → JSON DAG       │
+│  Step 0   [LLM]  Full text → ProcedureOverview          │
+│  Step 1   [LLM]  Per-chunk → Procedure (with carryover) │
+│  Step 2   [LLM]  Merge pseudocode ↔ original doc        │
+│  Step 3   [CODE] Deterministic compile → JSON DAG       │
 │                                                         │
-│  LLM's job ends after Stage 2.5. Stage 3 is pure code. │
+│  LLM's job ends after Step 2. Step 3 is pure code.      │
 └──────────────────────────┬──────────────────────────────┘
                            │
                       JSON DAG (nodes dict)
@@ -44,40 +44,38 @@ Raw SOP Text
 
 ---
 
-## Stage 1: TopDown — Extract the Macro Skeleton
+## Step 0: Overview — Extract the Global Map
 
-**Input:** Raw SOP text
-**Output:** `ProcedureCard` (Pydantic model)
+**Input:** Raw SOP text (or concatenated enriched chunk texts)
+**Output:** `ProcedureOverview` (Pydantic model)
 **Method:** LLM with structured output
 
-The LLM reads the entire SOP and produces a high-level skeleton:
+The LLM reads the SOP and produces a lightweight overview — just the global map, not a full skeleton:
 
 ```
-ProcedureCard
-├── title: "Fraud Dispute Resolution"
+ProcedureOverview
 ├── goal: "Resolve credit bureau disputes..."
-├── major_phases:
-│   ├── Phase("Intake", description="...", sub_steps=[...], decision_points=[...])
-│   ├── Phase("Investigation", ...)
-│   └── Phase("Resolution", ...)
-└── decision_gates:
-    ├── DecisionGate(condition="Is dispute code 183 or 186?", true_branch="...", false_branch="...")
-    └── DecisionGate(condition="Is there a force memo?", ...)
+├── phase_names: ["Intake", "Investigation", "Resolution"]
+└── cross_phase_decisions:
+    ├── "If fraud detected in intake, escalate in resolution"
+    └── "If force memo exists, skip standard investigation"
 ```
 
-**Why this stage exists:** The SOP is unstructured natural language. This stage forces the LLM to identify the structural backbone — phases, decision gates, goals — without worrying about granular details yet. It's a top-down decomposition: forest before trees.
+**Why this step exists:** Downstream per-chunk conversion needs global context — which phase a chunk belongs to, how decisions in one phase affect later phases. The overview is deliberately minimal (goal + phase names + cross-phase gates) to keep the LLM call cheap and the output small. It serves as a table of contents, not a full skeleton.
 
-**Prompt role:** `Senior Process Architect` — focuses on exhaustive extraction of phases and decision gates. Explicitly told not to invent steps.
+**Prompt role:** `Senior Process Architect` — focuses on extracting only the goal, phase names, and cross-phase decision gates. Explicitly told not to list sub-steps or enumerate every decision point.
 
 ---
 
-## Stage 2: CodeBased — Translate to Structured Pseudocode
+## Step 1: Per-Chunk Pseudocode — Sequential Conversion with Carryover
 
-**Input:** `ProcedureCard` + original SOP text
-**Output:** `PseudocodeBlock` (Pydantic model)
-**Method:** LLM with structured output
+**Input per call:** `ProcedureOverview` + enriched chunk text + RAG cross-references + previous chunk's `Procedure` output
+**Output per call:** A single `Procedure` (Pydantic model)
+**Method:** LLM with structured output, called sequentially for each chunk
 
-The LLM translates the skeleton into a code-like structure with two primitive types:
+Each enriched chunk is converted into a `Procedure` one at a time. The key mechanism is **carryover** — each call receives the previous chunk's `Procedure` output, enabling cross-chunk continuity.
+
+The pseudocode uses two primitive types:
 
 | Pseudocode primitive | What it represents |
 |---|---|
@@ -87,65 +85,71 @@ The LLM translates the skeleton into a code-like structure with two primitive ty
 These are wrapped in `StepItem` (a union type) and organized into `Procedure` objects:
 
 ```
-PseudocodeBlock
-└── procedures:
-    └── Procedure("Fraud Dispute Resolution")
-        ├── preconditions: ["Agent must be logged in", "Dispute ticket exists"]
-        ├── steps:
-        │   ├── StepItem(action_step=ActionStep("Receive dispute notification"))
-        │   ├── StepItem(conditional=ConditionalBlock(
-        │   │       condition="Is dispute code 183 or 186?",
-        │   │       if_true=[
-        │   │           StepItem(action_step=ActionStep("Route to fraud team")),
-        │   │           StepItem(conditional=ConditionalBlock(  ← nesting allowed
-        │   │               condition="Is borrower's account frozen?",
-        │   │               if_true=[...],
-        │   │               if_false=[...]
-        │   │           ))
-        │   │       ],
-        │   │       if_false=[
-        │   │           StepItem(action_step=ActionStep("Route to standard disputes"))
-        │   │       ]
-        │   │   ))
-        │   └── StepItem(action_step=ActionStep("End processing"))
-        └── postconditions: ["Dispute ticket marked as resolved"]
+Procedure("Intake Phase")
+├── preconditions: ["Dispute ticket exists"]
+├── steps:
+│   ├── StepItem(action_step=ActionStep("Receive dispute notification"))
+│   ├── StepItem(conditional=ConditionalBlock(
+│   │       condition="Is dispute code 183 or 186?",
+│   │       if_true=[
+│   │           StepItem(action_step=ActionStep("Route to fraud team")),
+│   │           StepItem(conditional=ConditionalBlock(  ← nesting allowed
+│   │               condition="Is borrower's account frozen?",
+│   │               if_true=[...],
+│   │               if_false=[...]
+│   │           ))
+│   │       ],
+│   │       if_false=[
+│   │           StepItem(action_step=ActionStep("Route to standard disputes"))
+│   │       ]
+│   │   ))
+│   └── StepItem(action_step=ActionStep("End processing"))
+└── postconditions: ["Dispute ticket routed to correct team"]
 ```
 
-**Why this stage exists:** The ProcedureCard is descriptive ("Phase: Investigation"). The pseudocode is prescriptive — it defines exact control flow with IF/ELSE branches that map 1:1 to graph structure. This is the representation that Stage 3 can mechanically compile.
+After all chunks are processed, the individual `Procedure` objects are assembled into a `PseudocodeBlock`.
+
+**Why this step exists:** The enriched chunks from preprocessing already contain rich, structured content with RAG cross-references. Converting per-chunk (rather than from a full-text skeleton) lets the LLM focus on a smaller, more tractable input. The carryover pattern ensures sequential coherence without requiring the LLM to hold the entire SOP in context at once.
+
+**Backward compatibility:** If no `enriched_chunks` are provided, the full SOP text is treated as a single chunk — the pipeline degrades gracefully to a single-call conversion.
 
 **Key rules the LLM follows:**
 - Every decision → `ConditionalBlock` with both branches
 - Every action → `ActionStep` (with optional `target` field for the system being acted on)
 - Nesting is allowed (conditionals inside conditionals)
 - Exact conditions from the SOP text are preserved verbatim
+- Cross-references used to resolve dangling references, but no invented steps
+- Continuity with previous chunk via preconditions
+
+**LLM call count:** 1 (overview) + N (chunks) + 1 (merge) = N+2 calls. For typical 3–6 chunk SOPs: 5–8 calls. Each per-chunk call has smaller context than a full-text call.
 
 ---
 
-## Stage 2.5: Merge — Reconcile with Original Document
+## Step 2: Merge — Reconcile with Original Document
 
 **Input:** `PseudocodeBlock` + original SOP text + (optional) RAG enrichment context
 **Output:** `PseudocodeBlock` (merged, more detailed)
 **Method:** LLM with structured output
 
-This is the **granularity guarantee** stage. The LLM compares the pseudocode line-by-line against the original SOP and adds anything that was missed:
+This is the **granularity guarantee** step. The LLM compares the pseudocode line-by-line against the original SOP and adds anything that was missed:
 
 - Specific system names, form numbers, team names
 - Threshold values, codes, reference IDs
 - External document references (guides, policies)
-- Implicit steps the skeleton glossed over
+- Implicit steps the per-chunk conversion glossed over
 
 **Rules:**
 1. NEVER remove or simplify existing steps — only ADD
 2. Preserve exact wording from SOP (the graph builder depends on this text)
 3. Every piece of information in the original SOP MUST appear somewhere in the output
 
-**Why this stage exists:** Stage 1+2 produce a structurally correct but potentially lossy skeleton. The merge stage is a "diff and patch" — it ensures no granular detail from the source document is lost before we lock the structure in Stage 3.
+**Why this step exists:** Per-chunk conversion produces structurally correct but potentially lossy procedures. The merge step is a "diff and patch" — it ensures no granular detail from the source document is lost before we lock the structure in Step 3. This step is non-negotiable.
 
 If RAG enrichment is available (from preprocessing), it's injected here as additional context — cross-references between chunks that the LLM might not have seen together.
 
 ---
 
-## Stage 3: Deterministic Graph Build — Pure Compilation
+## Step 3: Deterministic Graph Build — Pure Compilation
 
 **Input:** Merged `PseudocodeBlock`
 **Output:** `Dict[str, node_data]` — the JSON DAG
@@ -349,10 +353,16 @@ The final output is a Python dict mapping node IDs to node data:
 
 ## What Makes This Design Work
 
-1. **LLM narrows ambiguity, code compiles structure.** Stages 1–2.5 use the LLM for what it's good at (understanding natural language, identifying decision logic). Stage 3 uses deterministic code for what it's good at (building a correct, connected graph with no hallucination).
+1. **Chunks are the primary structural input.** The enriched chunks from preprocessing already contain rich, semantically segmented content with RAG cross-references. The pipeline builds on this directly rather than re-extracting structure from full text.
 
-2. **The merge stage (2.5) is the granularity guarantee.** Without it, the skeleton from Stages 1–2 might miss specific codes, team names, or threshold values. The merge forces a line-by-line reconciliation with the source document.
+2. **Overview provides global context cheaply.** A lightweight overview (goal + phase names + cross-phase decisions) gives each per-chunk call the "map" it needs without the cost of a full skeleton extraction.
 
-3. **Head/tails pattern prevents orphaned nodes.** The old builder had a critical bug: steps after a ConditionalBlock were unreachable because the chaining logic only wired `instruction` nodes. The head/tails pattern makes convergence automatic — both branches' exit points bubble up to the parent, which wires them to the next step.
+3. **Carryover maintains cross-chunk continuity.** Each chunk sees the previous chunk's output, so transitions between sections are coherent. This trades parallelization for sequential coherence — the right tradeoff for SOPs where section order matters.
 
-4. **Confidence labels drive refinement priority.** The refinement loop knows which edges to verify first — low-confidence auto-terminals are checked before high-confidence SOP-stated edges.
+4. **The merge step (Step 2) is the granularity guarantee.** Without it, per-chunk conversion might miss specific codes, team names, or threshold values. The merge forces a line-by-line reconciliation with the source document. This step is non-negotiable.
+
+5. **Head/tails pattern prevents orphaned nodes.** Every emit function returns (head_id, tail_ids). Both branches' exit points bubble up to the parent, which wires them to the next step. Convergence is automatic at any nesting depth.
+
+6. **Confidence labels drive refinement priority.** The refinement loop knows which edges to verify first — low-confidence auto-terminals are checked before high-confidence SOP-stated edges.
+
+7. **LLM narrows ambiguity, code compiles structure.** Steps 0–2 use the LLM for what it's good at (understanding natural language, identifying decision logic). Step 3 uses deterministic code for what it's good at (building a correct, connected graph with no hallucination).

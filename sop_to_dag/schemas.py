@@ -2,7 +2,7 @@
 
 Sections:
   - Graph models (WorkflowNode, ExtractorOutput, RefineFeedback)
-  - Intermediate models (ProcedureCard, PseudocodeBlock, etc.)
+  - Intermediate models (ProcedureOverview, PseudocodeBlock, etc.)
   - RAG models (DocumentChunks, DependencyQueries, EnrichedChunk, etc.)
   - Entity resolution models (EntityMapping, EntityMap)
   - State dicts (GraphState, RAGPrepState)
@@ -84,37 +84,19 @@ class RefineFeedback(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class DecisionGate(BaseModel):
-    """A decision point identified in the SOP."""
+class ProcedureOverview(BaseModel):
+    """Lightweight overview of the SOP — global context for per-chunk conversion."""
 
-    condition: str = Field(description="The condition being evaluated.")
-    true_branch: str = Field(description="What happens when condition is true.")
-    false_branch: str = Field(description="What happens when condition is false.")
-
-
-class Phase(BaseModel):
-    """A major phase or section of the SOP."""
-
-    name: str
-    description: str
-    decision_points: List[str] = Field(
-        default_factory=list,
-        description="Key decisions within this phase.",
+    goal: str = Field(description="The overarching goal of the SOP.")
+    phase_names: List[str] = Field(
+        description="Ordered list of major phase/section names."
     )
-    sub_steps: List[str] = Field(
+    cross_phase_decisions: List[str] = Field(
         default_factory=list,
-        description="Ordered sub-steps within this phase.",
-    )
-
-
-class ProcedureCard(BaseModel):
-    """Stage 1 output: high-level skeleton of the SOP."""
-
-    title: str
-    goal: str = Field(description="The overarching goal of this SOP.")
-    major_phases: List[Phase]
-    decision_gates: List[DecisionGate] = Field(
-        description="All decision points across the entire SOP."
+        description=(
+            "Decision gates that span multiple phases "
+            "(e.g., 'if fraud detected in intake, escalate in resolution')."
+        ),
     )
 
 
