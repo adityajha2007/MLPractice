@@ -77,12 +77,12 @@ def structural_similarity(
     edges_a = sum(
         1 for d in nodes_a.values() if d.get("next")
     ) + sum(
-        len(d.get("options", {})) for d in nodes_a.values()
+        len(d.get("options") or {}) for d in nodes_a.values()
     )
     edges_b = sum(
         1 for d in nodes_b.values() if d.get("next")
     ) + sum(
-        len(d.get("options", {})) for d in nodes_b.values()
+        len(d.get("options") or {}) for d in nodes_b.values()
     )
     edge_count_ratio = (
         min(edges_a, edges_b) / max(edges_a, edges_b)

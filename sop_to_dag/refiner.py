@@ -5,12 +5,23 @@ low-confidence edges first. ErrorResolver can use FAISS for surgical fixes.
 """
 
 import json
+import logging
 from typing import Any, Dict, List, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from pydantic import BaseModel
+
 from sop_to_dag.models import get_model
 from sop_to_dag.schemas import GraphState, WorkflowNode
+
+logger = logging.getLogger(__name__)
+
+
+class _NodePatch(BaseModel):
+    """Wrapper for structured output: list of repaired nodes."""
+
+    nodes: List[WorkflowNode]
 
 # ---------------------------------------------------------------------------
 # Inline prompts
@@ -177,8 +188,8 @@ class TripletVerifier:
                                     "explanation": r.get("explanation", ""),
                                 }
                             )
-        except (json.JSONDecodeError, AttributeError):
-            pass
+        except (json.JSONDecodeError, AttributeError) as e:
+            logger.warning("Failed to parse triplet verification response: %s", e)
 
         return invalid
 
@@ -266,14 +277,13 @@ class ErrorResolver:
             ),
         ]
 
-        structured_llm = self.llm.with_structured_output(
-            List[WorkflowNode]  # type: ignore[arg-type]
-        )
+        structured_llm = self.llm.with_structured_output(_NodePatch)
 
         try:
-            fixed_nodes = structured_llm.invoke(messages)
-            return [n.model_dump() for n in fixed_nodes]
-        except Exception:
+            result = structured_llm.invoke(messages)
+            return [n.model_dump() for n in result.nodes]
+        except Exception as e:
+            logger.warning("Resolution failed for node '%s': %s", node_id, e)
             return []
 
     def _get_2hop_neighborhood(
@@ -322,7 +332,9 @@ class ErrorResolver:
         for node_id in nodes:
             if node_id in feedback:
                 flagged.append(node_id)
-        return flagged if flagged else list(nodes.keys())[:3]
+        if not flagged:
+            logger.info("No node IDs found in feedback, skipping resolution")
+        return flagged
 
     def _get_issue_for_node(self, node_id: str, feedback: str) -> str:
         """Extract the specific issue description for a node from feedback."""

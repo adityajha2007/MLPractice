@@ -18,7 +18,10 @@ from sop_to_dag.storage import GraphStore
 MAX_ITERATIONS = 10
 
 
-def _build_graph(store: GraphStore | None = None) -> StateGraph:
+def _build_graph(
+    store: GraphStore | None = None,
+    max_iterations: int = MAX_ITERATIONS,
+) -> StateGraph:
     """Build the LangGraph StateGraph for the refinement loop."""
 
     def analyse_node(state: GraphState) -> GraphState:
@@ -38,7 +41,7 @@ def _build_graph(store: GraphStore | None = None) -> StateGraph:
         """Routing function: decide whether to refine or stop."""
         if state.get("is_complete", False):
             return "end"
-        if state.get("iteration", 0) >= MAX_ITERATIONS:
+        if state.get("iteration", 0) >= max_iterations:
             return "end"
         return "refine"
 
@@ -78,10 +81,7 @@ def run_refinement(
     Returns:
         Final refined GraphState.
     """
-    global MAX_ITERATIONS
-    MAX_ITERATIONS = max_iterations
-
-    graph = _build_graph(store)
+    graph = _build_graph(store, max_iterations=max_iterations)
     app = graph.compile()
 
     final_state = app.invoke(graph_state)

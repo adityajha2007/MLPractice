@@ -4,12 +4,26 @@ All three checks in one file. Inline prompts. Cheap checks run first.
 """
 
 import json
+import logging
 from typing import Any, Dict, List, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 from sop_to_dag.models import get_model
 from sop_to_dag.schemas import GraphState, RefineFeedback
+
+logger = logging.getLogger(__name__)
+
+
+class ContextFeedback(BaseModel):
+    """Structured output for the context adjacency check."""
+
+    is_valid: bool = Field(description="Whether all edges are logically valid.")
+    issues: List[str] = Field(
+        default_factory=list,
+        description="List of logical flow problems found.",
+    )
 
 # ---------------------------------------------------------------------------
 # Inline prompts
@@ -64,9 +78,8 @@ _CONTEXT_HUMAN = """\
 ## Current Nodes (JSON)
 {nodes_json}
 
-Evaluate logical adjacency of connected nodes. Return a JSON object with:
-- "is_valid": boolean
-- "issues": list of strings describing any logical flow problems
+Evaluate logical adjacency of connected nodes. Return a ContextFeedback with
+is_valid and issues.
 """
 
 
@@ -199,6 +212,7 @@ def check_context(nodes: dict, source_text: str) -> Dict[str, Any]:
     nodes_json = json.dumps(nodes, indent=2)
 
     llm = get_model("context")
+    structured_llm = llm.with_structured_output(ContextFeedback)
     messages = [
         SystemMessage(content=_CONTEXT_SYSTEM),
         HumanMessage(
@@ -209,19 +223,13 @@ def check_context(nodes: dict, source_text: str) -> Dict[str, Any]:
             )
         ),
     ]
-    response = llm.invoke(messages)
 
     try:
-        result = json.loads(response.content)
-        return {
-            "is_valid": result.get("is_valid", False),
-            "issues": result.get("issues", []),
-        }
-    except (json.JSONDecodeError, AttributeError):
-        return {
-            "is_valid": False,
-            "issues": [f"Failed to parse context check response: {response.content}"],
-        }
+        result = structured_llm.invoke(messages)
+        return {"is_valid": result.is_valid, "issues": result.issues}
+    except Exception as e:
+        logger.warning("Context check structured output failed: %s", e)
+        return {"is_valid": False, "issues": [f"Context check failed: {e}"]}
 
 
 # ---------------------------------------------------------------------------

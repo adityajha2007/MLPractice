@@ -6,7 +6,10 @@ LangGraph pipeline (4 nodes):
 Always runs before conversion. Even short docs benefit from entity resolution.
 """
 
+import logging
 from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
@@ -129,8 +132,8 @@ def agentic_chunk(state: RAGPrepState) -> RAGPrepState:
     try:
         result = structured_llm.invoke(messages)
         state["chunks"] = [c.model_dump() for c in result.chunks]
-    except Exception:
-        # Fallback: treat entire document as one chunk
+    except Exception as e:
+        logger.warning("Chunking failed, falling back to single chunk: %s", e)
         state["chunks"] = [
             {"chunk_id": 0, "title": "Full Document", "text": state["document"]}
         ]
@@ -224,7 +227,8 @@ def resolve_entities(state: RAGPrepState) -> RAGPrepState:
     try:
         entity_map = structured_llm.invoke(messages)
         mappings = [m.model_dump() for m in entity_map.mappings]
-    except Exception:
+    except Exception as e:
+        logger.warning("Entity resolution failed: %s", e)
         mappings = []
 
     # Replace aliases with canonical forms in enriched chunks
@@ -259,7 +263,8 @@ def _generate_queries(llm, chunk_id: int, chunk_text: str) -> List:
     try:
         result = structured_llm.invoke(messages)
         return result.queries
-    except Exception:
+    except Exception as e:
+        logger.warning("Query generation failed for chunk %d: %s", chunk_id, e)
         return []
 
 
@@ -280,7 +285,8 @@ def _grade_retrievals(llm, query: str, docs) -> List[bool]:
     try:
         result = structured_llm.invoke(messages)
         return [g.is_relevant for g in result.grades]
-    except Exception:
+    except Exception as e:
+        logger.warning("Retrieval grading failed for query '%s': %s", query, e)
         return [False] * len(docs)
 
 
