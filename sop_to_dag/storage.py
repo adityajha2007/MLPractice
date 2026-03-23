@@ -32,6 +32,12 @@ class GraphStore:
         filename = f"{safe_name}_{converter_id}_{timestamp[:19].replace(':', '-')}.json"
         path = self.store_dir / filename
 
+        # Exclude vector_store — it's a FAISS object, not JSON-serializable.
+        # It gets set to None on load anyway (line 60); only lives in memory.
+        serializable_state = {
+            k: v for k, v in graph_state.items() if k != "vector_store"
+        }
+
         envelope: Dict[str, Any] = {
             "metadata": {
                 "source": source_file,
@@ -39,9 +45,9 @@ class GraphStore:
                 "timestamp": timestamp,
                 "status": "draft",
             },
-            "graph_state": dict(graph_state),
+            "graph_state": serializable_state,
         }
-        path.write_text(json.dumps(envelope, indent=2, default=str))
+        path.write_text(json.dumps(envelope, indent=2))
         return path
 
     def load_graph(self, path: Path) -> GraphState:

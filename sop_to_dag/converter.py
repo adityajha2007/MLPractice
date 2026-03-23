@@ -8,13 +8,20 @@ Step 3 (Graph Build):    DETERMINISTIC walk of merged pseudocode -> WorkflowNode
 The LLM's job ends after the merge. Step 3 is pure compilation — no hallucination.
 """
 
+import json
+import logging
 import re
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel
 
 from sop_to_dag.models import get_model
+
+logger = logging.getLogger(__name__)
+
 from sop_to_dag.schemas import (
     ActionStep,
     ConditionalBlock,
@@ -460,17 +467,28 @@ class PipelineConverter:
         self,
         source_text: str,
         enriched_chunks: Optional[List[dict]] = None,
+        dump_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run the full pipeline.
 
         Args:
             source_text: Raw SOP text.
             enriched_chunks: Optional enriched chunks from preprocessing.
+            dump_dir: If provided, dump each stage's output to files in this
+                      directory for inspection.
 
         Returns:
             Dict mapping node_id to node data dicts.
         """
+        # Set up stage dump directory
+        dump_path: Optional[Path] = None
+        if dump_dir:
+            dump_path = Path(dump_dir)
+            dump_path.mkdir(parents=True, exist_ok=True)
+            logger.info("[CONVERTER] Stage outputs will be saved to: %s", dump_path)
+
         # Step 0: Lightweight overview extraction
+        logger.info("[CONVERTER Stage 0/3] Extracting overview (goal, phases, gates)...")
         overview: ProcedureOverview = _llm_extract(
             stage="top_down",
             system=_OVERVIEW_SYSTEM,
@@ -478,6 +496,12 @@ class PipelineConverter:
             output_schema=ProcedureOverview,
             source_text=source_text,
         )
+        logger.info("  Goal: %s", overview.goal)
+        logger.info("  Phases: %s", overview.phase_names)
+        logger.info("  Cross-phase decisions: %d", len(overview.cross_phase_decisions))
+
+        if dump_path:
+            self._dump_stage(dump_path, "stage0_overview", overview.model_dump_json(indent=2))
 
         # Step 1: Sequential per-chunk pseudocode with carryover
         procedures: List[Procedure] = []
@@ -487,7 +511,12 @@ class PipelineConverter:
             {"chunk_id": 0, "chunk_text": source_text, "retrieved_context": ""}
         ]
 
-        for ec in chunks_to_process:
+        total_chunks = len(chunks_to_process)
+        logger.info("[CONVERTER Stage 1/3] Per-chunk pseudocode — %d chunks to process...", total_chunks)
+
+        for idx, ec in enumerate(chunks_to_process):
+            logger.info("  Chunk %d/%d (id=%s): converting to pseudocode...",
+                         idx + 1, total_chunks, ec.get("chunk_id", idx))
             procedure: Procedure = _llm_extract(
                 stage="code_based",
                 system=_CHUNK_TO_PSEUDOCODE_SYSTEM,
@@ -500,10 +529,22 @@ class PipelineConverter:
             )
             procedures.append(procedure)
             prior_procedure_json = procedure.model_dump_json(indent=2)
+            logger.info("    Procedure '%s': %d steps, %d preconditions, %d postconditions",
+                         procedure.name, len(procedure.steps),
+                         len(procedure.preconditions), len(procedure.postconditions))
+
+            if dump_path:
+                self._dump_stage(dump_path, f"stage1_chunk{idx}_pseudocode",
+                                 procedure.model_dump_json(indent=2))
 
         pseudocode = PseudocodeBlock(procedures=procedures)
 
+        if dump_path:
+            self._dump_stage(dump_path, "stage1_all_pseudocode",
+                             pseudocode.model_dump_json(indent=2))
+
         # Step 2: Merge with original SOP for granular detail guarantee
+        logger.info("[CONVERTER Stage 2/3] Merging pseudocode with original SOP for detail guarantee...")
         enrichment_context = ""
         if enriched_chunks:
             context_parts = [
@@ -526,7 +567,36 @@ class PipelineConverter:
             source_text=source_text,
             enrichment_context=enrichment_context,
         )
+        total_steps = sum(len(p.steps) for p in merged_pseudocode.procedures)
+        logger.info("  Merged: %d procedures, %d total steps",
+                     len(merged_pseudocode.procedures), total_steps)
+
+        if dump_path:
+            self._dump_stage(dump_path, "stage2_merged_pseudocode",
+                             merged_pseudocode.model_dump_json(indent=2))
 
         # Step 3: Deterministic compilation -> WorkflowNode graph
+        logger.info("[CONVERTER Stage 3/3] Deterministic graph build (no LLM)...")
         builder = _GraphBuilder()
-        return builder.build(merged_pseudocode)
+        nodes = builder.build(merged_pseudocode)
+
+        # Log graph summary
+        type_counts: Dict[str, int] = {}
+        for n in nodes.values():
+            t = n.get("type", "unknown")
+            type_counts[t] = type_counts.get(t, 0) + 1
+        logger.info("  Graph built: %d nodes — %s", len(nodes), type_counts)
+        logger.info("[CONVERTER] Complete.")
+
+        if dump_path:
+            self._dump_stage(dump_path, "stage3_final_graph", json.dumps(nodes, indent=2))
+            logger.info("  All stage outputs saved to: %s", dump_path)
+
+        return nodes
+
+    @staticmethod
+    def _dump_stage(dump_dir: Path, name: str, content: str) -> None:
+        """Write a stage's output to a file for inspection."""
+        path = dump_dir / f"{name}.json"
+        path.write_text(content)
+        logger.info("  [DUMP] %s -> %s", name, path)

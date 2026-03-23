@@ -5,6 +5,7 @@ Usage:
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -16,6 +17,12 @@ from sop_to_dag.storage import GraphStore
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     parser = argparse.ArgumentParser(
         description="Full pipeline: SOP -> Preprocess -> JSON DAG -> Refined DAG."
     )
@@ -25,6 +32,12 @@ def main():
     )
     parser.add_argument(
         "--max-iterations", type=int, default=10, help="Max refinement iterations."
+    )
+    parser.add_argument(
+        "--dump-stages",
+        type=str,
+        default="output/stage_dumps",
+        help="Directory to dump intermediate stage outputs for inspection.",
     )
     args = parser.parse_args()
 
@@ -47,7 +60,8 @@ def main():
     print(f"\n=== CONVERSION ===")
     print(f"Converting: {sop_path.name}")
     converter = PipelineConverter()
-    nodes = converter.convert(source_text, prep_state["enriched_chunks"])
+    nodes = converter.convert(source_text, prep_state["enriched_chunks"],
+                              dump_dir=args.dump_stages)
     print(f"Conversion complete. Nodes: {len(nodes)}")
 
     # Save draft

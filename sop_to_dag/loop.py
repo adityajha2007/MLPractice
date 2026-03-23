@@ -8,12 +8,16 @@ Flow:
 Only used for the main pipeline converter, NOT for alternatives.
 """
 
+import logging
+
 from langgraph.graph import END, StateGraph
 
 from sop_to_dag.analyser import analyse
 from sop_to_dag.refiner import refine
 from sop_to_dag.schemas import GraphState
 from sop_to_dag.storage import GraphStore
+
+logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 10
 
@@ -40,9 +44,13 @@ def _build_graph(
     def should_continue(state: GraphState) -> str:
         """Routing function: decide whether to refine or stop."""
         if state.get("is_complete", False):
+            logger.info("[LOOP] Graph is complete — stopping refinement.")
             return "end"
         if state.get("iteration", 0) >= max_iterations:
+            logger.warning("[LOOP] Max iterations (%d) reached — stopping refinement.", max_iterations)
             return "end"
+        logger.info("[LOOP] Graph incomplete — routing to refiner (iteration %d)...",
+                     state.get("iteration", 0) + 1)
         return "refine"
 
     graph = StateGraph(GraphState)
@@ -81,8 +89,16 @@ def run_refinement(
     Returns:
         Final refined GraphState.
     """
+    logger.info("[LOOP] Starting refinement loop (max %d iterations, %d nodes)...",
+                 max_iterations, len(graph_state["nodes"]))
+
     graph = _build_graph(store, max_iterations=max_iterations)
     app = graph.compile()
 
     final_state = app.invoke(graph_state)
+
+    logger.info("[LOOP] Refinement loop finished after %d iterations. Complete: %s. Final nodes: %d.",
+                 final_state.get("iteration", 0),
+                 final_state.get("is_complete", False),
+                 len(final_state["nodes"]))
     return final_state

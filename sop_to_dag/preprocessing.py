@@ -121,6 +121,10 @@ Return an EntityMap with all synonym groups found.
 
 def agentic_chunk(state: RAGPrepState) -> RAGPrepState:
     """Node 1: LLM splits SOP at logical process boundaries."""
+    logger.info("[PREPROCESSING 1/4] Agentic chunking — splitting SOP into semantic chunks...")
+    doc_len = len(state["document"])
+    logger.info("  Input document: %d chars", doc_len)
+
     llm = get_model("chunking")
     structured_llm = llm.with_structured_output(DocumentChunks)
 
@@ -132,8 +136,11 @@ def agentic_chunk(state: RAGPrepState) -> RAGPrepState:
     try:
         result = structured_llm.invoke(messages)
         state["chunks"] = [c.model_dump() for c in result.chunks]
+        logger.info("  Produced %d chunks: %s",
+                     len(state["chunks"]),
+                     [c["title"] for c in state["chunks"]])
     except Exception as e:
-        logger.warning("Chunking failed, falling back to single chunk: %s", e)
+        logger.warning("  Chunking failed, falling back to single chunk: %s", e)
         state["chunks"] = [
             {"chunk_id": 0, "title": "Full Document", "text": state["document"]}
         ]
@@ -143,6 +150,7 @@ def agentic_chunk(state: RAGPrepState) -> RAGPrepState:
 
 def build_faiss_index(state: RAGPrepState) -> RAGPrepState:
     """Node 2: Embed all chunks into FAISS using HuggingFace bge-base-en."""
+    logger.info("[PREPROCESSING 2/4] Building FAISS index...")
     from langchain_community.vectorstores import FAISS
 
     embeddings = get_embeddings()
@@ -152,14 +160,18 @@ def build_faiss_index(state: RAGPrepState) -> RAGPrepState:
     if texts:
         vector_store = FAISS.from_texts(texts, embeddings, metadatas=metadatas)
         state["vector_store"] = vector_store
+        logger.info("  FAISS index built with %d documents", len(texts))
     else:
         state["vector_store"] = None
+        logger.warning("  No texts to index — FAISS store is None")
 
     return state
 
 
 def enrich_chunks(state: RAGPrepState) -> RAGPrepState:
     """Node 3: For each chunk, generate queries, retrieve, grade, synthesize."""
+    total_chunks = len(state["chunks"])
+    logger.info("[PREPROCESSING 3/4] RAG enrichment — processing %d chunks...", total_chunks)
     llm_query = get_model("enrichment")
     llm_grade = get_model("enrichment")
     vector_store = state["vector_store"]
@@ -168,9 +180,11 @@ def enrich_chunks(state: RAGPrepState) -> RAGPrepState:
     for chunk in state["chunks"]:
         chunk_id = chunk["chunk_id"]
         chunk_text = chunk["text"]
+        logger.info("  Chunk %d/%d: generating dependency queries...", chunk_id + 1, total_chunks)
 
         # Step 1: Generate dependency queries
         queries = _generate_queries(llm_query, chunk_id, chunk_text)
+        logger.info("    %d queries generated", len(queries))
 
         # Step 2 + 3: Retrieve and grade
         valid_context_parts: List[str] = []
@@ -192,6 +206,9 @@ def enrich_chunks(state: RAGPrepState) -> RAGPrepState:
 
             # Grade retrievals
             graded = _grade_retrievals(llm_grade, dep.query, docs)
+            accepted = sum(1 for g in graded if g)
+            logger.info("    Query '%s': %d/%d retrievals accepted",
+                         dep.query[:60], accepted, len(docs))
             for doc, grade in zip(docs, graded):
                 if grade:
                     valid_context_parts.append(doc.page_content)
@@ -203,13 +220,17 @@ def enrich_chunks(state: RAGPrepState) -> RAGPrepState:
             generated_queries=query_texts,
         )
         enriched.append(enriched_chunk.model_dump())
+        ctx_len = len(enriched_chunk.retrieved_context)
+        logger.info("    Chunk %d enriched: %d chars of retrieved context", chunk_id, ctx_len)
 
     state["enriched_chunks"] = enriched
+    logger.info("  Enrichment complete: %d chunks processed", len(enriched))
     return state
 
 
 def resolve_entities(state: RAGPrepState) -> RAGPrepState:
     """Node 4: Collect entity mentions, LLM groups synonyms, replace aliases."""
+    logger.info("[PREPROCESSING 4/4] Entity resolution — standardizing terminology...")
     llm = get_model("entity_resolution")
     structured_llm = llm.with_structured_output(EntityMap)
 
@@ -231,6 +252,10 @@ def resolve_entities(state: RAGPrepState) -> RAGPrepState:
         logger.warning("Entity resolution failed: %s", e)
         mappings = []
 
+    logger.info("  Found %d entity mappings", len(mappings))
+    for m in mappings:
+        logger.info("    '%s' <- %s", m["canonical"], m["aliases"])
+
     # Replace aliases with canonical forms in enriched chunks
     if mappings:
         for ec in state["enriched_chunks"]:
@@ -239,8 +264,10 @@ def resolve_entities(state: RAGPrepState) -> RAGPrepState:
                 ec["retrieved_context"] = _apply_entity_map(
                     ec["retrieved_context"], mappings
                 )
+        logger.info("  Applied entity map to %d enriched chunks", len(state["enriched_chunks"]))
 
     state["entity_map"] = mappings
+    logger.info("[PREPROCESSING] Complete.")
     return state
 
 

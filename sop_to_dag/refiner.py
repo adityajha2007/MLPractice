@@ -432,6 +432,9 @@ def refine(state: GraphState) -> GraphState:
 
     Mutates and returns the state with updated nodes and incremented iteration.
     """
+    iteration = state.get("iteration", 0) + 1
+    logger.info("[REFINER iter %d] Starting refinement cycle...", iteration)
+
     nodes = state["nodes"]
     source_text = state["source_text"]
     feedback = state["feedback"]
@@ -442,7 +445,13 @@ def refine(state: GraphState) -> GraphState:
     schema_validator = SchemaValidator()
 
     # 1. Triplet verification (conditionals only, low-confidence first)
+    logger.info("  [REFINER iter %d] Step 1: Triplet verification...", iteration)
     invalid_triplets = triplet_verifier.verify(nodes, source_text)
+    logger.info("    %d invalid triplets found", len(invalid_triplets))
+    for t in invalid_triplets:
+        logger.info("    INVALID: %s --(%s)--> %s: %s",
+                     t["source_id"], t["edge_label"], t["target_id"],
+                     t.get("explanation", "")[:100])
 
     if invalid_triplets:
         triplet_feedback = "\n".join(
@@ -453,17 +462,30 @@ def refine(state: GraphState) -> GraphState:
         feedback = f"{feedback}\n\nTriplet Issues:\n{triplet_feedback}"
 
     # 2. Error resolution (surgical LLM edits, with optional RAG)
+    logger.info("  [REFINER iter %d] Step 2: Error resolution...", iteration)
     if feedback.strip():
+        nodes_before = len(nodes)
         nodes = error_resolver.resolve(nodes, feedback, source_text, vector_store)
+        nodes_after = len(nodes)
+        logger.info("    Nodes: %d -> %d (delta: %+d)", nodes_before, nodes_after, nodes_after - nodes_before)
+    else:
+        logger.info("    No feedback to resolve — skipping")
 
     # 3. Schema validation (deterministic fixes)
+    logger.info("  [REFINER iter %d] Step 3: Schema validation...", iteration)
     nodes, fix_msgs = schema_validator.validate_and_fix(nodes)
+    if fix_msgs:
+        for msg in fix_msgs:
+            logger.info("    FIX: %s", msg)
+    else:
+        logger.info("    All nodes valid")
 
     state["nodes"] = nodes
-    state["iteration"] = state.get("iteration", 0) + 1
+    state["iteration"] = iteration
     if fix_msgs:
         state["feedback"] = (
             state.get("feedback", "") + "\nSchema fixes: " + "; ".join(fix_msgs)
         )
 
+    logger.info("  [REFINER iter %d] Complete. %d nodes in graph.", iteration, len(nodes))
     return state

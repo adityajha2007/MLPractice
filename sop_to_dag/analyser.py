@@ -243,30 +243,46 @@ def analyse(state: GraphState) -> GraphState:
     Mutates and returns the state with updated feedback, analysis_report,
     and is_complete fields.
     """
+    iteration = state.get("iteration", 0)
+    logger.info("[ANALYSER iter %d] Analysing graph with %d nodes...", iteration, len(state["nodes"]))
+
     nodes = state["nodes"]
     source_text = state["source_text"]
     report_parts = []
 
     # 1. Topological check (code-based, free)
+    logger.info("  [ANALYSER] Check 1/3: Topological (pure Python)...")
     topo_report = get_graph_issues(nodes)
     report_parts.append(f"## Topological Check\n{topo_report}")
     has_topo_issues = topo_report != "Topology Valid."
+    if has_topo_issues:
+        logger.warning("    Topology issues found: %s", topo_report)
+    else:
+        logger.info("    Topology: VALID")
 
     # 2. Completeness check (LLM-based)
+    logger.info("  [ANALYSER] Check 2/3: Completeness (LLM)...")
     completeness = check_completeness(nodes, source_text)
     report_parts.append(
         f"## Completeness Check\n"
         f"Complete: {completeness.is_complete}\n"
         f"Missing: {completeness.missing_branches}"
     )
+    logger.info("    Complete: %s", completeness.is_complete)
+    if completeness.missing_branches:
+        logger.info("    Missing branches: %s", completeness.missing_branches)
 
     # 3. Context check (LLM-based)
+    logger.info("  [ANALYSER] Check 3/3: Context adjacency (LLM)...")
     context_result = check_context(nodes, source_text)
     report_parts.append(
         f"## Context Check\n"
         f"Valid: {context_result['is_valid']}\n"
         f"Issues: {context_result['issues']}"
     )
+    logger.info("    Valid: %s", context_result["is_valid"])
+    if context_result["issues"]:
+        logger.info("    Context issues: %s", context_result["issues"])
 
     # Aggregate: graph is complete only if ALL checks pass
     is_complete = (
@@ -291,5 +307,8 @@ def analyse(state: GraphState) -> GraphState:
     state["is_complete"] = is_complete
     state["feedback"] = "\n".join(feedback_parts) if feedback_parts else ""
     state["analysis_report"] = "\n\n".join(report_parts)
+
+    verdict = "PASS — graph is complete" if is_complete else "FAIL — needs refinement"
+    logger.info("  [ANALYSER] Verdict: %s", verdict)
 
     return state
