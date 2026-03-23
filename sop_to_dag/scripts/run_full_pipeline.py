@@ -2,6 +2,7 @@
 
 Usage:
     python -m sop_to_dag.scripts.run_full_pipeline <sop_file_path>
+    python -m sop_to_dag.scripts.run_full_pipeline <sop_file_path> --resume <run_dir>
 """
 
 import argparse
@@ -39,20 +40,54 @@ def _dump_preprocessing(run_dir: Path, prep_state: dict) -> None:
     )
 
 
+def _load_preprocessing(run_dir: Path) -> dict | None:
+    """Load cached preprocessing outputs from a previous run directory.
+
+    Returns a dict with chunks, enriched_chunks, entity_map, and
+    vector_store=None (must be rebuilt if needed). Returns None if
+    any required file is missing.
+    """
+    chunks_path = run_dir / "prep_chunks.json"
+    enriched_path = run_dir / "prep_enriched_chunks.json"
+    entity_path = run_dir / "prep_entity_map.json"
+
+    if not all(p.exists() for p in [chunks_path, enriched_path, entity_path]):
+        return None
+
+    return {
+        "chunks": json.loads(chunks_path.read_text()),
+        "enriched_chunks": json.loads(enriched_path.read_text()),
+        "entity_map": json.loads(entity_path.read_text()),
+        "vector_store": None,  # not serializable; rebuilt if needed
+    }
+
+
+def _rebuild_vector_store(prep_state: dict) -> None:
+    """Rebuild the FAISS vector store from cached chunks (for refinement RAG)."""
+    from langchain_community.vectorstores import FAISS
+    from sop_to_dag.models import get_embeddings
+
+    chunks = prep_state["chunks"]
+    if not chunks:
+        return
+
+    texts = [c["text"] for c in chunks]
+    metadatas = [{"chunk_id": c["chunk_id"], "title": c["title"]} for c in chunks]
+    embeddings = get_embeddings()
+    prep_state["vector_store"] = FAISS.from_texts(texts, embeddings, metadatas=metadatas)
+
 
 def _setup_logging(run_dir: Path) -> None:
     """Configure logging to both console and a log file in the run directory."""
     log_format = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
     date_format = "%H:%M:%S"
 
-    # Console handler
     logging.basicConfig(
         level=logging.INFO,
         format=log_format,
         datefmt=date_format,
     )
 
-    # File handler — saves ALL log output to run.log
     file_handler = logging.FileHandler(run_dir / "run.log")
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
@@ -76,6 +111,12 @@ def main():
         default="output/stage_dumps",
         help="Base directory for stage dumps (a timestamped subdirectory is created per run).",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to a previous run directory to resume from (skips cached stages).",
+    )
     args = parser.parse_args()
 
     sop_path = Path(args.sop_file)
@@ -86,25 +127,42 @@ def main():
     source_text = sop_path.read_text()
     store = GraphStore(store_dir=Path(args.output_dir))
 
-    # Create a unique run directory for this invocation
-    run_dir = _create_run_dir(args.dump_stages, sop_path.stem)
+    # Use existing run dir if resuming, otherwise create new one
+    if args.resume:
+        run_dir = Path(args.resume)
+        if not run_dir.exists():
+            print(f"Error: Resume directory not found: {run_dir}")
+            sys.exit(1)
+        print(f"Resuming from: {run_dir}")
+    else:
+        run_dir = _create_run_dir(args.dump_stages, sop_path.stem)
+
     _setup_logging(run_dir)
     print(f"Stage dumps: {run_dir}")
+    is_resume = args.resume is not None
 
     # Phase 0: Preprocessing
     print("=== PREPROCESSING ===")
-    prep_state = run_preprocessing(source_text)
+    cached_prep = _load_preprocessing(run_dir) if is_resume else None
+    if cached_prep:
+        print("Loaded preprocessing from cache.")
+        prep_state = cached_prep
+        # Rebuild FAISS for refinement RAG lookups
+        print("Rebuilding FAISS vector store from cached chunks...")
+        _rebuild_vector_store(prep_state)
+    else:
+        prep_state = run_preprocessing(source_text)
+        _dump_preprocessing(run_dir, prep_state)
     print(f"Chunks: {len(prep_state['chunks'])}")
     print(f"Enriched chunks: {len(prep_state['enriched_chunks'])}")
     print(f"Entity mappings: {len(prep_state['entity_map'])}")
-    _dump_preprocessing(run_dir, prep_state)
 
     # Phase 1: Convert
     print(f"\n=== CONVERSION ===")
     print(f"Converting: {sop_path.name}")
     converter = PipelineConverter()
     nodes = converter.convert(source_text, prep_state["enriched_chunks"],
-                              dump_dir=str(run_dir))
+                              dump_dir=str(run_dir), resume=is_resume)
     print(f"Conversion complete. Nodes: {len(nodes)}")
 
     # Save draft

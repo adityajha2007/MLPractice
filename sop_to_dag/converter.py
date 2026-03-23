@@ -464,6 +464,7 @@ class PipelineConverter:
         source_text: str,
         enriched_chunks: Optional[List[dict]] = None,
         dump_dir: Optional[str] = None,
+        resume: bool = False,
     ) -> Dict[str, Any]:
         """Run the full pipeline.
 
@@ -472,6 +473,8 @@ class PipelineConverter:
             enriched_chunks: Optional enriched chunks from preprocessing.
             dump_dir: If provided, dump each stage's output to files in this
                       directory for inspection.
+            resume: If True AND dump_dir has cached stage files, load from
+                    cache instead of re-running LLM calls (saves API credits).
 
         Returns:
             Dict mapping node_id to node data dicts.
@@ -481,93 +484,108 @@ class PipelineConverter:
         if dump_dir:
             dump_path = Path(dump_dir)
             dump_path.mkdir(parents=True, exist_ok=True)
-            logger.info("[CONVERTER] Stage outputs will be saved to: %s", dump_path)
+            logger.info("[CONVERTER] Stage outputs dir: %s (resume=%s)", dump_path, resume)
 
         # Step 0: Lightweight overview extraction
-        logger.info("[CONVERTER Stage 0/3] Extracting overview (goal, phases, gates)...")
-        overview: ProcedureOverview = _llm_extract(
-            stage="top_down",
-            system=_OVERVIEW_SYSTEM,
-            human=_OVERVIEW_HUMAN,
-            output_schema=ProcedureOverview,
-            source_text=source_text,
-        )
+        cached_overview = self._load_cache(dump_path, "stage0_overview") if resume else None
+        if cached_overview:
+            logger.info("[CONVERTER Stage 0/3] Loaded overview from cache.")
+            overview = ProcedureOverview.model_validate_json(cached_overview)
+        else:
+            logger.info("[CONVERTER Stage 0/3] Extracting overview (goal, phases, gates)...")
+            overview = _llm_extract(
+                stage="top_down",
+                system=_OVERVIEW_SYSTEM,
+                human=_OVERVIEW_HUMAN,
+                output_schema=ProcedureOverview,
+                source_text=source_text,
+            )
+            if dump_path:
+                self._dump_stage(dump_path, "stage0_overview", overview.model_dump_json(indent=2))
+
         logger.info("  Goal: %s", overview.goal)
         logger.info("  Phases: %s", overview.phase_names)
         logger.info("  Cross-phase decisions: %d", len(overview.cross_phase_decisions))
 
-        if dump_path:
-            self._dump_stage(dump_path, "stage0_overview", overview.model_dump_json(indent=2))
-
         # Step 1: Sequential per-chunk pseudocode with carryover
-        procedures: List[Procedure] = []
-        prior_procedure_json = ""
+        cached_all_pseudo = self._load_cache(dump_path, "stage1_all_pseudocode") if resume else None
+        if cached_all_pseudo:
+            logger.info("[CONVERTER Stage 1/3] Loaded all pseudocode from cache.")
+            pseudocode = PseudocodeBlock.model_validate_json(cached_all_pseudo)
+        else:
+            procedures: List[Procedure] = []
+            prior_procedure_json = ""
 
-        chunks_to_process = enriched_chunks if enriched_chunks else [
-            {"chunk_id": 0, "chunk_text": source_text, "retrieved_context": ""}
-        ]
+            chunks_to_process = enriched_chunks if enriched_chunks else [
+                {"chunk_id": 0, "chunk_text": source_text, "retrieved_context": ""}
+            ]
 
-        total_chunks = len(chunks_to_process)
-        logger.info("[CONVERTER Stage 1/3] Per-chunk pseudocode — %d chunks to process...", total_chunks)
+            total_chunks = len(chunks_to_process)
+            logger.info("[CONVERTER Stage 1/3] Per-chunk pseudocode — %d chunks to process...", total_chunks)
 
-        for idx, ec in enumerate(chunks_to_process):
-            logger.info("  Chunk %d/%d (id=%s): converting to pseudocode...",
-                         idx + 1, total_chunks, ec.get("chunk_id", idx))
-            procedure: Procedure = _llm_extract(
-                stage="code_based",
-                system=_CHUNK_TO_PSEUDOCODE_SYSTEM,
-                human=_CHUNK_TO_PSEUDOCODE_HUMAN,
-                output_schema=Procedure,
-                overview=overview.model_dump_json(indent=2),
-                chunk_text=ec["chunk_text"],
-                retrieved_context=ec.get("retrieved_context", ""),
-                prior_procedure=prior_procedure_json,
-            )
-            procedures.append(procedure)
-            prior_procedure_json = procedure.model_dump_json(indent=2)
-            logger.info("    Procedure '%s': %d steps", procedure.name, len(procedure.steps))
+            for idx, ec in enumerate(chunks_to_process):
+                logger.info("  Chunk %d/%d (id=%s): converting to pseudocode...",
+                             idx + 1, total_chunks, ec.get("chunk_id", idx))
+                procedure: Procedure = _llm_extract(
+                    stage="code_based",
+                    system=_CHUNK_TO_PSEUDOCODE_SYSTEM,
+                    human=_CHUNK_TO_PSEUDOCODE_HUMAN,
+                    output_schema=Procedure,
+                    overview=overview.model_dump_json(indent=2),
+                    chunk_text=ec["chunk_text"],
+                    retrieved_context=ec.get("retrieved_context", ""),
+                    prior_procedure=prior_procedure_json,
+                )
+                procedures.append(procedure)
+                prior_procedure_json = procedure.model_dump_json(indent=2)
+                logger.info("    Procedure '%s': %d steps", procedure.name, len(procedure.steps))
+
+                if dump_path:
+                    self._dump_stage(dump_path, f"stage1_chunk{idx}_pseudocode",
+                                     procedure.model_dump_json(indent=2))
+
+            pseudocode = PseudocodeBlock(procedures=procedures)
 
             if dump_path:
-                self._dump_stage(dump_path, f"stage1_chunk{idx}_pseudocode",
-                                 procedure.model_dump_json(indent=2))
+                self._dump_stage(dump_path, "stage1_all_pseudocode",
+                                 pseudocode.model_dump_json(indent=2))
 
-        pseudocode = PseudocodeBlock(procedures=procedures)
+        # Step 2: Merge / consolidate
+        cached_merged = self._load_cache(dump_path, "stage2_merged_pseudocode") if resume else None
+        if cached_merged:
+            logger.info("[CONVERTER Stage 2/3] Loaded merged pseudocode from cache.")
+            merged_pseudocode = PseudocodeBlock.model_validate_json(cached_merged)
+        else:
+            logger.info("[CONVERTER Stage 2/3] Consolidating pseudocode with original SOP...")
+            enrichment_context = ""
+            if enriched_chunks:
+                context_parts = [
+                    f"## Context for Chunk {ec['chunk_id']}\n{ec['retrieved_context']}"
+                    for ec in enriched_chunks
+                    if ec.get("retrieved_context")
+                ]
+                if context_parts:
+                    enrichment_context = (
+                        "## Cross-Reference Context\n"
+                        + "\n\n".join(context_parts)
+                    )
 
-        if dump_path:
-            self._dump_stage(dump_path, "stage1_all_pseudocode",
-                             pseudocode.model_dump_json(indent=2))
+            merged_pseudocode = _llm_extract(
+                stage="code_based",
+                system=_MERGE_SYSTEM,
+                human=_MERGE_HUMAN,
+                output_schema=PseudocodeBlock,
+                pseudocode=pseudocode.model_dump_json(indent=2),
+                source_text=source_text,
+                enrichment_context=enrichment_context,
+            )
+            if dump_path:
+                self._dump_stage(dump_path, "stage2_merged_pseudocode",
+                                 merged_pseudocode.model_dump_json(indent=2))
 
-        # Step 2: Merge with original SOP for granular detail guarantee
-        logger.info("[CONVERTER Stage 2/3] Merging pseudocode with original SOP for detail guarantee...")
-        enrichment_context = ""
-        if enriched_chunks:
-            context_parts = [
-                f"## Context for Chunk {ec['chunk_id']}\n{ec['retrieved_context']}"
-                for ec in enriched_chunks
-                if ec.get("retrieved_context")
-            ]
-            if context_parts:
-                enrichment_context = (
-                    "## Cross-Reference Context\n"
-                    + "\n\n".join(context_parts)
-                )
-
-        merged_pseudocode: PseudocodeBlock = _llm_extract(
-            stage="code_based",
-            system=_MERGE_SYSTEM,
-            human=_MERGE_HUMAN,
-            output_schema=PseudocodeBlock,
-            pseudocode=pseudocode.model_dump_json(indent=2),
-            source_text=source_text,
-            enrichment_context=enrichment_context,
-        )
         total_steps = sum(len(p.steps) for p in merged_pseudocode.procedures)
         logger.info("  Merged: %d procedures, %d total steps",
                      len(merged_pseudocode.procedures), total_steps)
-
-        if dump_path:
-            self._dump_stage(dump_path, "stage2_merged_pseudocode",
-                             merged_pseudocode.model_dump_json(indent=2))
 
         # Step 3: Deterministic compilation -> WorkflowNode graph
         logger.info("[CONVERTER Stage 3/3] Deterministic graph build (no LLM)...")
@@ -587,6 +605,17 @@ class PipelineConverter:
             logger.info("  All stage outputs saved to: %s", dump_path)
 
         return nodes
+
+    @staticmethod
+    def _load_cache(dump_dir: Optional[Path], name: str) -> Optional[str]:
+        """Load a cached stage output. Returns file content or None."""
+        if dump_dir is None:
+            return None
+        path = dump_dir / f"{name}.json"
+        if path.exists():
+            logger.info("  [CACHE HIT] %s <- %s", name, path)
+            return path.read_text()
+        return None
 
     @staticmethod
     def _dump_stage(dump_dir: Path, name: str, content: str) -> None:
