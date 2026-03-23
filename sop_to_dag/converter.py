@@ -557,6 +557,9 @@ class PipelineConverter:
             merged_pseudocode = PseudocodeBlock.model_validate_json(cached_merged)
         else:
             logger.info("[CONVERTER Stage 2/3] Consolidating pseudocode with original SOP...")
+
+            # Build enrichment context, but cap it to avoid blowing the context window.
+            # The pseudocode + SOP already take most of the budget; enrichment is supplementary.
             enrichment_context = ""
             if enriched_chunks:
                 context_parts = [
@@ -565,20 +568,32 @@ class PipelineConverter:
                     if ec.get("retrieved_context")
                 ]
                 if context_parts:
-                    enrichment_context = (
-                        "## Cross-Reference Context\n"
-                        + "\n\n".join(context_parts)
-                    )
+                    full_context = "\n\n".join(context_parts)
+                    # Cap enrichment context at ~4000 chars to leave room for output
+                    if len(full_context) > 4000:
+                        logger.warning("  Enrichment context too large (%d chars), "
+                                       "truncating to 4000 chars.", len(full_context))
+                        full_context = full_context[:4000] + "\n... (truncated)"
+                    enrichment_context = "## Cross-Reference Context\n" + full_context
 
-            merged_pseudocode = _llm_extract(
-                stage="code_based",
-                system=_MERGE_SYSTEM,
-                human=_MERGE_HUMAN,
-                output_schema=PseudocodeBlock,
-                pseudocode=pseudocode.model_dump_json(indent=2),
-                source_text=source_text,
-                enrichment_context=enrichment_context,
-            )
+            try:
+                merged_pseudocode = _llm_extract(
+                    stage="code_based",
+                    system=_MERGE_SYSTEM,
+                    human=_MERGE_HUMAN,
+                    output_schema=PseudocodeBlock,
+                    pseudocode=pseudocode.model_dump_json(indent=2),
+                    source_text=source_text,
+                    enrichment_context=enrichment_context,
+                )
+            except Exception as e:
+                # If the merge fails (e.g., token limit exceeded), fall back to
+                # Stage 1 output. The per-chunk pseudocode is already solid after
+                # the prompt improvements — the merge is a nice-to-have, not critical.
+                logger.warning("[CONVERTER Stage 2/3] Merge failed (%s). "
+                               "Falling back to Stage 1 pseudocode.", e)
+                merged_pseudocode = pseudocode
+
             if dump_path:
                 self._dump_stage(dump_path, "stage2_merged_pseudocode",
                                  merged_pseudocode.model_dump_json(indent=2))
