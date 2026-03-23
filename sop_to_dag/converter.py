@@ -85,6 +85,12 @@ Rules:
 7. Use cross-reference context to resolve dangling references, but do NOT
    invent steps that are not in the chunk text or its cross-references
 8. Ensure continuity with the previous chunk's output
+9. CRITICAL: If the chunk references steps/procedures from OTHER chunks (e.g.,
+   "proceed to fraud resolution", "go to Step 5"), include those referenced
+   steps as ActionSteps INSIDE the relevant branch of the conditional. Use the
+   cross-reference context and overview to understand what those steps entail.
+   Do NOT leave branches with just a "go to X" placeholder — expand them with
+   the actual actions from the referenced step/section.
 """
 
 _CHUNK_TO_PSEUDOCODE_HUMAN = """\
@@ -110,32 +116,36 @@ short, descriptive `id` field.
 _MERGE_SYSTEM = """\
 You are a Process Quality Reviewer. Your job is to compare a structured
 pseudocode representation against the ORIGINAL SOP document and ensure
-correctness and completeness WITHOUT inflating granularity.
+correctness, completeness, and proper cross-procedure linking.
 
 You receive:
-1. A PseudocodeBlock (structured procedures with steps and conditions)
+1. A PseudocodeBlock with MULTIPLE procedures (one per SOP chunk)
 2. The original SOP text
 
-Your task: produce a FINAL PseudocodeBlock that is correct, complete, and SIMPLE.
+Your PRIMARY task: produce a FINAL PseudocodeBlock that merges all procedures
+into ONE UNIFIED PROCEDURE with a single connected flow. The downstream graph
+builder chains procedures sequentially, so if the SOP has non-linear branches
+(e.g., "if fraud → go to resolution step"), these MUST be represented as nested
+ConditionalBlocks, NOT as separate procedures.
 
 Rules:
-1. Verify that every DECISION PATH in the SOP is represented — no missing branches
-2. Verify that key references to external guides/documents are captured
-3. CONSOLIDATE redundant or overly granular steps — merge micro-steps into
-   broader meaningful actions. Each step should represent one significant
-   business action or decision, not a sub-operation.
-4. Do NOT add new sub-steps, preconditions, postconditions, or context-setting
-   nodes. The pseudocode should stay at the same level of abstraction as the SOP.
-5. If a specific system name, code, or threshold appears in the SOP and is
-   relevant to a decision or action, include it in the step's text — but do
-   NOT create a separate step just for that detail.
+1. MERGE all procedures into ideally ONE procedure (or as few as possible).
+   If procedure A's branch says "go to fraud resolution" and procedure C has
+   the fraud resolution steps, those steps MUST appear INSIDE procedure A's
+   conditional branch — not as a separate procedure.
+2. Verify that every DECISION PATH in the SOP is represented — no missing branches
+3. Verify that key references to external guides/documents are captured
+4. CONSOLIDATE redundant or overly granular steps — merge micro-steps into
+   broader meaningful actions.
+5. Do NOT add new sub-steps, preconditions, postconditions, or context-setting
+   nodes. Stay at the same level of abstraction as the SOP.
 6. Keep every ActionStep and ConditionalBlock `id` short and descriptive
    (2-4 words, snake_case). Question IDs should end with '_question'.
 7. Remove any steps that are purely informational context rather than actions.
 """
 
 _MERGE_HUMAN = """\
-## Current Pseudocode
+## Current Pseudocode (one procedure per chunk — needs merging)
 {pseudocode}
 
 ## Original SOP Text (the ground truth)
@@ -143,9 +153,60 @@ _MERGE_HUMAN = """\
 
 {enrichment_context}
 
-Review the pseudocode against the SOP. Fix any missing decision branches or
-references. Consolidate any overly granular steps. Return the final
-PseudocodeBlock — simpler is better as long as all paths are covered.
+IMPORTANT: Merge all procedures into ONE unified procedure. If a branch in one
+procedure references steps from another procedure, inline those steps into the
+branch. The graph builder processes procedures sequentially — non-linear jumps
+will break unless they are nested inside conditionals. Return the final
+PseudocodeBlock — simpler is better as long as all paths are correctly connected.
+"""
+
+_SUMMARIZE_CONTEXT_SYSTEM = """\
+You are a concise technical summarizer. Summarize the cross-reference context
+below into a compact form that preserves ALL:
+- Entity names, system names, team names, and document/guide references
+- Decision-relevant details (codes, thresholds, conditions)
+- Cross-chunk relationships (which chunks reference which other chunks)
+
+Remove redundancy, verbose descriptions, and filler. Keep it factual and dense.
+Output plain text, not structured data.
+"""
+
+_SUMMARIZE_CONTEXT_HUMAN = """\
+Summarize this cross-reference context concisely:
+
+{context}
+"""
+
+_PAIRWISE_MERGE_SYSTEM = """\
+You are a Process Linker. You receive TWO procedures and must merge them into
+ONE unified procedure that preserves the complete flow.
+
+Rules:
+1. Identify how the two procedures connect — look for branches in Procedure A
+   that reference content from Procedure B, or sequential flow from A into B.
+2. If Procedure A has a branch that should lead into Procedure B's steps,
+   INLINE those steps into the branch's step list.
+3. If the flow is purely sequential (A finishes, then B starts), concatenate
+   A's steps followed by B's steps into one procedure.
+4. Preserve ALL decision branches and actions — do not drop any paths.
+5. CONSOLIDATE any duplicate or redundant steps that appear in both procedures.
+6. Keep every ActionStep and ConditionalBlock `id` short and descriptive
+   (2-4 words, snake_case). Question IDs should end with '_question'.
+"""
+
+_PAIRWISE_MERGE_HUMAN = """\
+## Procedure A (already merged from earlier chunks)
+{procedure_a}
+
+## Procedure B (next chunk to integrate)
+{procedure_b}
+
+## SOP Overview (for context on how these connect)
+{overview}
+
+Merge these two procedures into ONE procedure. Inline Procedure B's steps into
+the correct location within Procedure A's flow. Return a PseudocodeBlock with
+exactly ONE procedure.
 """
 
 
@@ -558,8 +619,9 @@ class PipelineConverter:
         else:
             logger.info("[CONVERTER Stage 2/3] Consolidating pseudocode with original SOP...")
 
-            # Build enrichment context, but cap it to avoid blowing the context window.
-            # The pseudocode + SOP already take most of the budget; enrichment is supplementary.
+            # Summarize enrichment context instead of truncating — preserves
+            # key details (entity names, codes, cross-references) while fitting
+            # within the context window.
             enrichment_context = ""
             if enriched_chunks:
                 context_parts = [
@@ -569,30 +631,26 @@ class PipelineConverter:
                 ]
                 if context_parts:
                     full_context = "\n\n".join(context_parts)
-                    # Cap enrichment context at ~4000 chars to leave room for output
                     if len(full_context) > 4000:
-                        logger.warning("  Enrichment context too large (%d chars), "
-                                       "truncating to 4000 chars.", len(full_context))
-                        full_context = full_context[:4000] + "\n... (truncated)"
+                        logger.info("  Enrichment context is %d chars — summarizing with LLM...",
+                                    len(full_context))
+                        full_context = self._summarize_context(full_context)
+                        logger.info("  Summarized to %d chars.", len(full_context))
                     enrichment_context = "## Cross-Reference Context\n" + full_context
 
-            try:
-                merged_pseudocode = _llm_extract(
-                    stage="code_based",
-                    system=_MERGE_SYSTEM,
-                    human=_MERGE_HUMAN,
-                    output_schema=PseudocodeBlock,
-                    pseudocode=pseudocode.model_dump_json(indent=2),
-                    source_text=source_text,
-                    enrichment_context=enrichment_context,
+            num_procedures = len(pseudocode.procedures)
+
+            if num_procedures <= 3:
+                # Small SOP — single-shot merge is safe
+                merged_pseudocode = self._single_merge(
+                    pseudocode, source_text, enrichment_context
                 )
-            except Exception as e:
-                # If the merge fails (e.g., token limit exceeded), fall back to
-                # Stage 1 output. The per-chunk pseudocode is already solid after
-                # the prompt improvements — the merge is a nice-to-have, not critical.
-                logger.warning("[CONVERTER Stage 2/3] Merge failed (%s). "
-                               "Falling back to Stage 1 pseudocode.", e)
-                merged_pseudocode = pseudocode
+            else:
+                # Large SOP — pairwise incremental merge to stay within token limits
+                logger.info("  %d procedures — using pairwise merge strategy.", num_procedures)
+                merged_pseudocode = self._pairwise_merge(
+                    pseudocode, overview, source_text, enrichment_context
+                )
 
             if dump_path:
                 self._dump_stage(dump_path, "stage2_merged_pseudocode",
@@ -620,6 +678,109 @@ class PipelineConverter:
             logger.info("  All stage outputs saved to: %s", dump_path)
 
         return nodes
+
+    @staticmethod
+    def _summarize_context(context: str) -> str:
+        """Use LLM to summarize enrichment context, preserving key details."""
+        llm = get_model("enrichment")
+        messages = [
+            SystemMessage(content=_SUMMARIZE_CONTEXT_SYSTEM),
+            HumanMessage(content=_SUMMARIZE_CONTEXT_HUMAN.format(context=context)),
+        ]
+        try:
+            response = llm.invoke(messages)
+            return response.content
+        except Exception as e:
+            logger.warning("  Context summarization failed (%s), using first 4000 chars.", e)
+            return context[:4000] + "\n... (truncated due to summarization failure)"
+
+    @staticmethod
+    def _single_merge(
+        pseudocode: PseudocodeBlock,
+        source_text: str,
+        enrichment_context: str,
+    ) -> PseudocodeBlock:
+        """Single-shot merge: all procedures + SOP in one LLM call."""
+        try:
+            return _llm_extract(
+                stage="code_based",
+                system=_MERGE_SYSTEM,
+                human=_MERGE_HUMAN,
+                output_schema=PseudocodeBlock,
+                pseudocode=pseudocode.model_dump_json(indent=2),
+                source_text=source_text,
+                enrichment_context=enrichment_context,
+            )
+        except Exception as e:
+            logger.warning("[CONVERTER Stage 2/3] Single merge failed (%s). "
+                           "Falling back to Stage 1 pseudocode.", e)
+            return pseudocode
+
+    @staticmethod
+    def _pairwise_merge(
+        pseudocode: PseudocodeBlock,
+        overview: ProcedureOverview,
+        source_text: str,
+        enrichment_context: str,
+    ) -> PseudocodeBlock:
+        """Incremental pairwise merge: merge procedures two at a time.
+
+        This keeps each LLM call within token limits even for large SOPs.
+        The overview provides cross-chunk context so the LLM knows how
+        procedures relate to each other.
+        """
+        procedures = pseudocode.procedures
+        if len(procedures) == 0:
+            return pseudocode
+        if len(procedures) == 1:
+            return pseudocode
+
+        # Start with the first procedure and incrementally merge each next one
+        accumulated = procedures[0]
+        overview_json = overview.model_dump_json(indent=2)
+
+        for i, next_proc in enumerate(procedures[1:], start=2):
+            logger.info("  Pairwise merge: integrating procedure %d/%d ('%s')...",
+                         i, len(procedures), next_proc.name)
+            try:
+                merged_block: PseudocodeBlock = _llm_extract(
+                    stage="code_based",
+                    system=_PAIRWISE_MERGE_SYSTEM,
+                    human=_PAIRWISE_MERGE_HUMAN,
+                    output_schema=PseudocodeBlock,
+                    procedure_a=accumulated.model_dump_json(indent=2),
+                    procedure_b=next_proc.model_dump_json(indent=2),
+                    overview=overview_json,
+                )
+                if merged_block.procedures:
+                    accumulated = merged_block.procedures[0]
+                else:
+                    logger.warning("    Pairwise merge returned empty — keeping previous.")
+            except Exception as e:
+                logger.warning("    Pairwise merge failed (%s) — appending sequentially.", e)
+                # Fallback: just concatenate steps (sequential chaining)
+                accumulated = Procedure(
+                    name=accumulated.name,
+                    steps=accumulated.steps + next_proc.steps,
+                )
+
+        # Final quality pass: compare merged result against original SOP
+        logger.info("  Final quality pass: verifying merged procedure against SOP...")
+        final_pseudocode = PseudocodeBlock(procedures=[accumulated])
+        try:
+            final_pseudocode = _llm_extract(
+                stage="code_based",
+                system=_MERGE_SYSTEM,
+                human=_MERGE_HUMAN,
+                output_schema=PseudocodeBlock,
+                pseudocode=final_pseudocode.model_dump_json(indent=2),
+                source_text=source_text,
+                enrichment_context=enrichment_context,
+            )
+        except Exception as e:
+            logger.warning("  Final quality pass failed (%s) — using pairwise result.", e)
+
+        return final_pseudocode
 
     @staticmethod
     def _load_cache(dump_dir: Optional[Path], name: str) -> Optional[str]:
