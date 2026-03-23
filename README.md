@@ -47,6 +47,7 @@ sop_to_dag/
     test_storage.py
     test_validator.py
     test_metrics.py
+    test_graph_builder.py
 ```
 
 ## Setup
@@ -111,9 +112,9 @@ A 4-node LangGraph pipeline that always runs before conversion:
 
 3.5-stage pipeline — LLM narrows ambiguity, then deterministic compilation:
 
-- **Stage 1 (TopDown)** -- LLM extracts macro ProcedureCard skeleton: goal, phases, decision gates
-- **Stage 2 (CodeBased)** -- LLM translates ProcedureCard into structured pseudocode with IF/ELSE blocks, sequential actions, pre/postconditions
-- **Stage 2.5 (Merge)** -- LLM reconciles pseudocode with the **original document** line-by-line to capture every granular detail (specific codes, team names, thresholds, references) the skeleton may have missed
+- **Stage 0 (Overview)** -- LLM extracts a lightweight ProcedureOverview: goal, phase names, cross-phase decision gates
+- **Stage 1 (Per-Chunk Pseudocode)** -- LLM converts each enriched chunk into a Procedure (structured pseudocode with IF/ELSE blocks, sequential actions, pre/postconditions) with carryover from the previous chunk for continuity
+- **Stage 2 (Merge)** -- LLM reconciles assembled pseudocode with the **original document** line-by-line to capture every granular detail (specific codes, team names, thresholds, references) the skeleton may have missed
 - **Stage 3 (Deterministic Graph Build)** -- Pure Python tree walk compiles the merged pseudocode into WorkflowNodes. `ActionStep -> instruction`, `ConditionalBlock -> question`, end states -> `terminal`. No LLM involved — zero hallucination risk
 
 ### 3. Refinement Loop (`loop.py`)
