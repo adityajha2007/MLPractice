@@ -103,6 +103,13 @@ class ProcedureOverview(BaseModel):
 class ActionStep(BaseModel):
     """A single sequential action."""
 
+    id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Short snake_case ID for this step (2-4 words). "
+            "Example: 'start_processing', 'update_status_fraud', 'mark_fraud_confirmed'."
+        ),
+    )
     action: str = Field(description="What to do.")
     target: Optional[str] = Field(
         default=None, description="Entity or system acted upon."
@@ -112,6 +119,13 @@ class ActionStep(BaseModel):
 class ConditionalBlock(BaseModel):
     """An IF/ELSE decision block."""
 
+    id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Short snake_case ID for this decision (2-4 words, ending with '_question'). "
+            "Example: 'check_dispute_code_question', 'check_fraud_indicators_question'."
+        ),
+    )
     condition: str
     if_true: List["StepItem"] = Field(description="Steps when condition is true.")
     if_false: List["StepItem"] = Field(
@@ -127,12 +141,10 @@ class StepItem(BaseModel):
 
 
 class Procedure(BaseModel):
-    """A named procedure with pre/postconditions and ordered steps."""
+    """A named procedure with ordered steps."""
 
     name: str
-    preconditions: List[str] = Field(default_factory=list)
     steps: List[StepItem]
-    postconditions: List[str] = Field(default_factory=list)
 
 
 class PseudocodeBlock(BaseModel):

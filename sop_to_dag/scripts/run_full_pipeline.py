@@ -5,8 +5,10 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from sop_to_dag.converter import PipelineConverter
@@ -16,13 +18,48 @@ from sop_to_dag.schemas import GraphState
 from sop_to_dag.storage import GraphStore
 
 
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        datefmt="%H:%M:%S",
+def _create_run_dir(base_dir: str, sop_name: str) -> Path:
+    """Create a unique timestamped directory for this run's stage dumps."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = Path(base_dir) / f"{sop_name}_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def _dump_preprocessing(run_dir: Path, prep_state: dict) -> None:
+    """Dump preprocessing outputs (chunks, enriched chunks, entity map)."""
+    (run_dir / "prep_chunks.json").write_text(
+        json.dumps(prep_state["chunks"], indent=2)
+    )
+    (run_dir / "prep_enriched_chunks.json").write_text(
+        json.dumps(prep_state["enriched_chunks"], indent=2)
+    )
+    (run_dir / "prep_entity_map.json").write_text(
+        json.dumps(prep_state["entity_map"], indent=2)
     )
 
+
+
+def _setup_logging(run_dir: Path) -> None:
+    """Configure logging to both console and a log file in the run directory."""
+    log_format = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+    date_format = "%H:%M:%S"
+
+    # Console handler
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        datefmt=date_format,
+    )
+
+    # File handler — saves ALL log output to run.log
+    file_handler = logging.FileHandler(run_dir / "run.log")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
+    logging.getLogger().addHandler(file_handler)
+
+
+def main():
     parser = argparse.ArgumentParser(
         description="Full pipeline: SOP -> Preprocess -> JSON DAG -> Refined DAG."
     )
@@ -37,7 +74,7 @@ def main():
         "--dump-stages",
         type=str,
         default="output/stage_dumps",
-        help="Directory to dump intermediate stage outputs for inspection.",
+        help="Base directory for stage dumps (a timestamped subdirectory is created per run).",
     )
     args = parser.parse_args()
 
@@ -49,19 +86,25 @@ def main():
     source_text = sop_path.read_text()
     store = GraphStore(store_dir=Path(args.output_dir))
 
+    # Create a unique run directory for this invocation
+    run_dir = _create_run_dir(args.dump_stages, sop_path.stem)
+    _setup_logging(run_dir)
+    print(f"Stage dumps: {run_dir}")
+
     # Phase 0: Preprocessing
     print("=== PREPROCESSING ===")
     prep_state = run_preprocessing(source_text)
     print(f"Chunks: {len(prep_state['chunks'])}")
     print(f"Enriched chunks: {len(prep_state['enriched_chunks'])}")
     print(f"Entity mappings: {len(prep_state['entity_map'])}")
+    _dump_preprocessing(run_dir, prep_state)
 
     # Phase 1: Convert
     print(f"\n=== CONVERSION ===")
     print(f"Converting: {sop_path.name}")
     converter = PipelineConverter()
     nodes = converter.convert(source_text, prep_state["enriched_chunks"],
-                              dump_dir=args.dump_stages)
+                              dump_dir=str(run_dir))
     print(f"Conversion complete. Nodes: {len(nodes)}")
 
     # Save draft
@@ -80,10 +123,11 @@ def main():
     draft_path = store.save_graph(state, str(sop_path), converter.converter_id)
     print(f"Draft saved: {draft_path}")
 
-    # Phase 2: Refine
+    # Phase 2: Refine (per-iteration dumps happen inside the loop)
     print(f"\n=== REFINEMENT ===")
     print(f"Starting refinement loop (max {args.max_iterations} iterations)...")
-    final_state = run_refinement(state, max_iterations=args.max_iterations, store=store)
+    final_state = run_refinement(state, max_iterations=args.max_iterations,
+                                 store=store, dump_dir=str(run_dir))
 
     print(f"\nRefinement complete!")
     print(f"Iterations: {final_state['iteration']}")
@@ -95,6 +139,7 @@ def main():
     )
     store.update_status(final_path, "final")
     print(f"Final graph saved: {final_path}")
+    print(f"All stage dumps: {run_dir}")
 
 
 if __name__ == "__main__":

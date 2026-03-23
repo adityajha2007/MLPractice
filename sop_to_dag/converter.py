@@ -71,17 +71,20 @@ You receive:
 - The previous chunk's Procedure output (may be empty for the first chunk)
 
 Rules:
-1. Every sequential action becomes an ActionStep
-2. Every decision point becomes a ConditionalBlock with IF/ELSE branches
-3. Preserve the EXACT conditions from the source text — do not simplify or rephrase
-4. The Procedure should have clear preconditions and postconditions
+1. Every sequential action becomes an ActionStep with a short, descriptive snake_case `id`
+   (2-4 words). Examples: 'start_processing', 'mark_fraud_confirmed', 'update_status_fraud'
+2. Every decision point becomes a ConditionalBlock with a short `id` ending in '_question'.
+   Examples: 'check_dispute_code_question', 'check_fraud_indicators_question'
+3. Keep steps at a BROAD, meaningful level — each step should represent one
+   significant business action or decision, NOT micro-operations. Do NOT split
+   a single SOP step into multiple sub-steps unless there is a genuine decision branch.
+4. Do NOT create separate nodes for preconditions, postconditions, or context-setting
+   statements. Fold any relevant context into the action text of the step itself.
 5. Nested conditionals are allowed (ConditionalBlock within ConditionalBlock)
 6. Cover ALL paths — every branch must lead somewhere
 7. Use cross-reference context to resolve dangling references, but do NOT
    invent steps that are not in the chunk text or its cross-references
-8. Ensure continuity with the previous chunk's output — if the prior procedure
-   ends with an action or branch that leads into this chunk, set appropriate
-   preconditions
+8. Ensure continuity with the previous chunk's output
 """
 
 _CHUNK_TO_PSEUDOCODE_HUMAN = """\
@@ -99,46 +102,50 @@ Convert this SOP chunk into a structured Procedure.
 ## Previous Chunk's Procedure (for continuity)
 {prior_procedure}
 
-Return a single Procedure with name, preconditions, steps, and postconditions.
+Return a single Procedure with name and steps. Keep steps broad — one step per
+meaningful action or decision. Every ActionStep and ConditionalBlock MUST have a
+short, descriptive `id` field.
 """
 
 _MERGE_SYSTEM = """\
-You are a Detail Reconciliation Specialist. Your job is to compare a structured
-pseudocode representation against the ORIGINAL SOP document and ensure nothing
-is missing.
+You are a Process Quality Reviewer. Your job is to compare a structured
+pseudocode representation against the ORIGINAL SOP document and ensure
+correctness and completeness WITHOUT inflating granularity.
 
 You receive:
 1. A PseudocodeBlock (structured procedures with steps and conditions)
 2. The original SOP text
 
-Your task: produce a MERGED PseudocodeBlock that contains EVERYTHING from the
-original pseudocode PLUS any granular details from the SOP that were missed.
+Your task: produce a FINAL PseudocodeBlock that is correct, complete, and SIMPLE.
 
 Rules:
-1. NEVER remove or simplify existing steps — only ADD missing details
-2. If the SOP mentions a specific system, form, team, threshold, or reference
-   that the pseudocode glossed over, add it as an ActionStep in the right place
-3. If a conditional branch in the SOP has more detail than the pseudocode
-   captures (e.g., specific codes, team names, document references), expand it
-4. If the SOP mentions external references (guides, documents), ensure they
-   appear as ActionSteps with the target field set to the reference name
-5. Preserve the exact wording from the SOP for conditions and actions — the
-   graph builder downstream depends on this text for node descriptions
-6. Every piece of information in the original SOP MUST appear somewhere in
-   the output pseudocode. Missing even one detail is a failure.
+1. Verify that every DECISION PATH in the SOP is represented — no missing branches
+2. Verify that key references to external guides/documents are captured
+3. CONSOLIDATE redundant or overly granular steps — merge micro-steps into
+   broader meaningful actions. Each step should represent one significant
+   business action or decision, not a sub-operation.
+4. Do NOT add new sub-steps, preconditions, postconditions, or context-setting
+   nodes. The pseudocode should stay at the same level of abstraction as the SOP.
+5. If a specific system name, code, or threshold appears in the SOP and is
+   relevant to a decision or action, include it in the step's text — but do
+   NOT create a separate step just for that detail.
+6. Keep every ActionStep and ConditionalBlock `id` short and descriptive
+   (2-4 words, snake_case). Question IDs should end with '_question'.
+7. Remove any steps that are purely informational context rather than actions.
 """
 
 _MERGE_HUMAN = """\
 ## Current Pseudocode
 {pseudocode}
 
-## Original SOP Text (the ground truth — NOTHING here should be lost)
+## Original SOP Text (the ground truth)
 {source_text}
 
 {enrichment_context}
 
-Compare line by line. Add any missing granular details to produce the final
-merged PseudocodeBlock. If nothing is missing, return the pseudocode as-is.
+Review the pseudocode against the SOP. Fix any missing decision branches or
+references. Consolidate any overly granular steps. Return the final
+PseudocodeBlock — simpler is better as long as all paths are covered.
 """
 
 
@@ -165,9 +172,9 @@ def _llm_extract(
 
 
 def _to_snake_case(text: str) -> str:
-    """Convert a text description to a snake_case node ID."""
-    # Take first ~6 words, lowercase, replace non-alphanum with underscores
-    words = re.sub(r"[^a-zA-Z0-9\s]", "", text).lower().split()[:6]
+    """Convert a text description to a snake_case node ID (fallback)."""
+    # Take first ~4 words, lowercase, replace non-alphanum with underscores
+    words = re.sub(r"[^a-zA-Z0-9\s]", "", text).lower().split()[:4]
     slug = "_".join(words)
     return slug or "node"
 
@@ -226,20 +233,9 @@ class _GraphBuilder:
 
     def build(self, pseudocode: PseudocodeBlock) -> Dict[str, Any]:
         """Walk all procedures and return the complete nodes dict."""
-        # Build a unified step list with preconditions/postconditions
         all_steps: List[StepItem] = []
         for proc in pseudocode.procedures:
-            # Emit preconditions as action steps
-            for pre in proc.preconditions:
-                all_steps.append(
-                    StepItem(action_step=ActionStep(action=f"Precondition: {pre}"))
-                )
             all_steps.extend(proc.steps)
-            # Emit postconditions as action steps
-            for post in proc.postconditions:
-                all_steps.append(
-                    StepItem(action_step=ActionStep(action=f"Postcondition: {post}"))
-                )
 
         if not all_steps:
             self._add_terminal("end", "No steps found in procedure.")
@@ -317,7 +313,7 @@ class _GraphBuilder:
         Returns (node_id, [node_id]) — the node is its own tail.
         Terminals return (node_id, []) — nothing to wire after them.
         """
-        base_id = forced_id or _to_snake_case(action.action)
+        base_id = forced_id or action.id or _to_snake_case(action.action)
         node_id = forced_id or self._unique_id(base_id)
 
         # Build node text, incorporating target metadata if present
@@ -366,7 +362,7 @@ class _GraphBuilder:
         branches' exit points can be wired to whatever comes AFTER
         this conditional in the parent step list.
         """
-        base_id = forced_id or _to_snake_case(cond.condition)
+        base_id = forced_id or cond.id or _to_snake_case(cond.condition)
         node_id = forced_id or self._unique_id(base_id)
 
         # Walk true branch
@@ -529,9 +525,7 @@ class PipelineConverter:
             )
             procedures.append(procedure)
             prior_procedure_json = procedure.model_dump_json(indent=2)
-            logger.info("    Procedure '%s': %d steps, %d preconditions, %d postconditions",
-                         procedure.name, len(procedure.steps),
-                         len(procedure.preconditions), len(procedure.postconditions))
+            logger.info("    Procedure '%s': %d steps", procedure.name, len(procedure.steps))
 
             if dump_path:
                 self._dump_stage(dump_path, f"stage1_chunk{idx}_pseudocode",
