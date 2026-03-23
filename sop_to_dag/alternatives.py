@@ -5,12 +5,16 @@ the refinement loop. Inline prompts at top of file.
 """
 
 import json
-from typing import Any, Dict, List, Optional
+import logging
+from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 from sop_to_dag.models import get_model
 from sop_to_dag.schemas import ExtractorOutput
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Bottom-Up (PADME-inspired) prompts
@@ -21,10 +25,10 @@ You are a Document Segmentation Specialist. Split the following SOP text into
 logical semantic chunks. Each chunk should represent a coherent section or
 sub-procedure of the SOP.
 
-Return a JSON list of objects with:
-- "chunk_id": sequential integer
-- "title": brief title for the chunk
-- "text": the chunk content
+Each chunk should have:
+- chunk_id: sequential integer
+- title: brief title for the chunk
+- text: the chunk content
 """
 
 _CHUNKER_HUMAN = """\
@@ -109,7 +113,7 @@ Extract all workflow entities from this SOP:
 {source_text}
 ---
 
-Return a JSON list of objects with: id, type, text, external_ref (optional).
+Return a VertexList with all extracted workflow entities.
 """
 
 _EDGE_SYSTEM = """\
@@ -138,6 +142,40 @@ _EDGE_HUMAN = """\
 Map all edges (next/options) for each node. Return the complete node list
 with edges populated as an ExtractorOutput.
 """
+
+
+# ---------------------------------------------------------------------------
+# Structured output models for raw-LLM calls
+# ---------------------------------------------------------------------------
+
+
+class _SemanticChunk(BaseModel):
+    """A single semantic chunk from LLM-based document splitting."""
+
+    chunk_id: int
+    title: str
+    text: str
+
+
+class _ChunkList(BaseModel):
+    """Structured output for the chunking step."""
+
+    chunks: List[_SemanticChunk]
+
+
+class _Vertex(BaseModel):
+    """A single workflow entity extracted without connections."""
+
+    id: str
+    type: Literal["question", "instruction", "terminal", "reference"]
+    text: str
+    external_ref: Optional[str] = None
+
+
+class _VertexList(BaseModel):
+    """Structured output for vertex extraction."""
+
+    vertices: List[_Vertex]
 
 
 # ---------------------------------------------------------------------------
@@ -192,16 +230,17 @@ class BottomUpConverter:
 
     def _chunk_text(self, source_text: str) -> List[Dict[str, str]]:
         """Split SOP text into semantic chunks via LLM."""
+        structured_llm = self.llm.with_structured_output(_ChunkList)
         messages = [
             SystemMessage(content=_CHUNKER_SYSTEM),
             HumanMessage(content=_CHUNKER_HUMAN.format(source_text=source_text)),
         ]
-        response = self.llm.invoke(messages)
 
         try:
-            chunks = json.loads(response.content)
-            return chunks if isinstance(chunks, list) else [{"title": "full", "text": source_text}]
-        except (json.JSONDecodeError, AttributeError):
+            result = structured_llm.invoke(messages)
+            return [c.model_dump() for c in result.chunks]
+        except Exception as e:
+            logger.warning("LLM chunking failed, using full document: %s", e)
             return [{"title": "full", "text": source_text}]
 
     def _process_chunk(
@@ -278,16 +317,17 @@ class EdgeVertexConverter:
 
     def _extract_vertices(self, source_text: str) -> List[Dict[str, Any]]:
         """Stage A: Extract all workflow entities with no connections."""
+        structured_llm = self.llm.with_structured_output(_VertexList)
         messages = [
             SystemMessage(content=_VERTEX_SYSTEM),
             HumanMessage(content=_VERTEX_HUMAN.format(source_text=source_text)),
         ]
-        response = self.llm.invoke(messages)
 
         try:
-            vertices = json.loads(response.content)
-            return vertices if isinstance(vertices, list) else []
-        except (json.JSONDecodeError, AttributeError):
+            result = structured_llm.invoke(messages)
+            return [v.model_dump() for v in result.vertices]
+        except Exception as e:
+            logger.warning("Vertex extraction failed: %s", e)
             return []
 
     def _map_edges(

@@ -23,6 +23,20 @@ class _NodePatch(BaseModel):
 
     nodes: List[WorkflowNode]
 
+
+class _TripletResult(BaseModel):
+    """Result of verifying a single triplet."""
+
+    triplet_index: int
+    is_valid: bool
+    explanation: str = ""
+
+
+class _TripletVerification(BaseModel):
+    """Structured output for triplet batch verification."""
+
+    results: List[_TripletResult]
+
 # ---------------------------------------------------------------------------
 # Inline prompts
 # ---------------------------------------------------------------------------
@@ -46,10 +60,8 @@ _TRIPLET_HUMAN = """\
 ## Triplets to Verify (batch)
 {triplets_json}
 
-For each triplet, respond with:
-- "triplet_index": the index number
-- "is_valid": boolean
-- "explanation": why it is valid or invalid
+For each triplet, return a _TripletResult with triplet_index, is_valid, and
+explanation.
 """
 
 _RESOLVER_SYSTEM = """\
@@ -162,6 +174,7 @@ class TripletVerifier:
     ) -> List[Dict[str, Any]]:
         """Verify a single batch of triplets via LLM."""
         numbered = [{**t, "index": idx} for idx, t in enumerate(batch)]
+        structured_llm = self.llm.with_structured_output(_TripletVerification)
 
         messages = [
             SystemMessage(content=_TRIPLET_SYSTEM),
@@ -172,24 +185,20 @@ class TripletVerifier:
                 )
             ),
         ]
-        response = self.llm.invoke(messages)
 
         invalid = []
         try:
-            results = json.loads(response.content)
-            if isinstance(results, list):
-                for r in results:
-                    if not r.get("is_valid", True):
-                        idx = r.get("triplet_index", 0)
-                        if idx < len(batch):
-                            invalid.append(
-                                {
-                                    **batch[idx],
-                                    "explanation": r.get("explanation", ""),
-                                }
-                            )
-        except (json.JSONDecodeError, AttributeError) as e:
-            logger.warning("Failed to parse triplet verification response: %s", e)
+            verification = structured_llm.invoke(messages)
+            for r in verification.results:
+                if not r.is_valid and r.triplet_index < len(batch):
+                    invalid.append(
+                        {
+                            **batch[r.triplet_index],
+                            "explanation": r.explanation,
+                        }
+                    )
+        except Exception as e:
+            logger.warning("Triplet verification failed: %s", e)
 
         return invalid
 
