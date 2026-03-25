@@ -312,6 +312,17 @@ def _parse_branch(
 # Direct text-to-graph parser (no PseudocodeBlock intermediate)
 # ---------------------------------------------------------------------------
 
+_TERMINAL_KEYWORDS = [
+    "end processing", "end of process", "end of procedure",
+    "end the process", "end the procedure", "process complete",
+    "processing complete", "procedure complete", "no further action",
+    "stop processing", "workflow complete", "close the case",
+    "mark as complete", "mark as done", "mark onboarding as complete",
+    "end of onboarding",
+]
+
+_BuildResult = Tuple[Optional[str], List[str]]
+
 
 def parse_outline_to_graph(text: str) -> Dict[str, Any]:
     """Parse a plain-text outline directly into graph nodes.
@@ -481,18 +492,6 @@ def _parse_branch_and_emit(
 # ---------------------------------------------------------------------------
 # Deterministic graph builder
 # ---------------------------------------------------------------------------
-
-_TERMINAL_KEYWORDS = [
-    "end processing", "end of process", "end of procedure",
-    "end the process", "end the procedure", "process complete",
-    "processing complete", "procedure complete", "no further action",
-    "stop processing", "workflow complete", "close the case",
-    "mark as complete", "mark as done", "mark onboarding as complete",
-    "end of onboarding",
-]
-
-_BuildResult = Tuple[Optional[str], List[str]]
-
 
 def _chain_results(builder: "_GraphBuilder", step_results: List[_BuildResult]) -> _BuildResult:
     """Wire a sequence of _BuildResults: each step's tails → next step's head.
