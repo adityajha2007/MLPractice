@@ -132,8 +132,8 @@ def main():
     print(f"  Chunks: {len(prep_state['chunks'])}")
     print(f"  Entity mappings: {len(prep_state['entity_map'])}")
 
-    # Conversion: 3-stage pipeline
-    print("Running 3-stage pipeline (Overview -> Pseudocode -> Merge -> Graph)...")
+    # Conversion: enriched SOP -> outline -> graph
+    print("Running conversion pipeline (Enriched SOP -> Outline -> Graph)...")
     converter = PipelineConverter()
     nodes = converter.convert(source_text, prep_state["enriched_chunks"],
                               dump_dir=str(run_dir), resume=is_resume)

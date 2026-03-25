@@ -110,9 +110,17 @@ class ActionStep(BaseModel):
             "Example: 'start_processing', 'update_status_fraud', 'mark_fraud_confirmed'."
         ),
     )
-    action: str = Field(description="What to do.")
+    action: str = Field(
+        description=(
+            "Self-explanatory description of what to do. Must include the system, "
+            "entity, or document name directly — a reader should understand the full "
+            "action from this text alone. Example: 'Update case status to Fraud "
+            "Confirmed in the Case Management System'."
+        )
+    )
     target: Optional[str] = Field(
-        default=None, description="Entity or system acted upon."
+        default=None,
+        description="Optional: entity or system acted upon (for metadata only, not displayed).",
     )
 
 
