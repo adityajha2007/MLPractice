@@ -91,7 +91,9 @@ Your job:
    is captured in the outline
 3. If anything is MISSING — add it in the correct location
 4. If the section references external documents/guides not in the outline — add them
-5. Do NOT remove or restructure existing steps
+5. Do NOT remove existing steps. You MAY expand a single coarse step into
+   multiple detailed sub-steps if the SOP section describes multiple distinct
+   actions that the step collapses into one line.
 6. Do NOT add steps that aren't in the SOP section
 7. If a chunk contains an action but the condition/decision for that action is
    missing, look at the current outline to infer where it belongs based on

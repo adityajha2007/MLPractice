@@ -11,7 +11,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from sop_to_dag.models import get_model
-from sop_to_dag.schemas import GraphState, RefineFeedback
+from sop_to_dag.schemas import GranularityFeedback, GraphState, RefineFeedback
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,43 @@ _CONTEXT_HUMAN = """\
 
 Evaluate logical adjacency of connected nodes. Return a ContextFeedback with
 is_valid and issues.
+"""
+
+_GRANULARITY_SYSTEM = """\
+You are a Process Granularity Auditor. Your job is to compare each non-terminal
+node in a workflow graph against the original SOP and identify nodes that are
+TOO COARSE — i.e., a single node that collapses multiple distinct user actions
+into one step.
+
+A node is "coarse" when:
+- The corresponding SOP text describes 2 or more SEPARATE actions that a user
+  must perform sequentially (e.g., "Open the system, navigate to the tab, and
+  enter the data" is 3 actions crammed into one node).
+- The node text uses conjunctions like "and", "then", or semicolons to join
+  multiple operations.
+- The SOP section for this step contains sub-bullets, numbered sub-steps, or
+  multiple imperative verbs describing distinct operations.
+
+A node is NOT coarse when:
+- It describes a single atomic action (even if the text is long for clarity).
+- It is a decision/question node asking one question.
+- It is a terminal or reference node.
+
+For each coarse node, estimate how many sub-steps it should be split into.
+Be conservative — only flag nodes where the SOP clearly describes multiple
+distinct actions. Do not flag nodes just because they could theoretically be
+more detailed.
+"""
+
+_GRANULARITY_HUMAN = """\
+## Original SOP
+{source_text}
+
+## Current Nodes (JSON)
+{nodes_json}
+
+Identify coarse nodes. Return GranularityFeedback with is_granular and
+coarse_nodes (each with node_id, reason, suggested_split).
 """
 
 
@@ -232,13 +269,39 @@ def check_context(nodes: dict, source_text: str) -> Dict[str, Any]:
         return {"is_valid": False, "issues": [f"Context check failed: {e}"]}
 
 
+def check_granularity(nodes: dict, source_text: str) -> GranularityFeedback:
+    """LLM check: are graph nodes granular enough vs the source SOP?"""
+    nodes_json = json.dumps(nodes, indent=2)
+
+    llm = get_model("completeness")  # same temp=0.0 as other analyser checks
+    structured_llm = llm.with_structured_output(GranularityFeedback)
+    messages = [
+        SystemMessage(content=_GRANULARITY_SYSTEM),
+        HumanMessage(
+            content=_GRANULARITY_HUMAN.format(
+                source_text=source_text,
+                nodes_json=nodes_json,
+            )
+        ),
+    ]
+
+    try:
+        return structured_llm.invoke(messages)
+    except Exception as e:
+        logger.warning("Granularity check failed: %s", e)
+        return GranularityFeedback(
+            is_granular=False,
+            coarse_nodes=[],
+        )
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
 
 def analyse(state: GraphState) -> GraphState:
-    """Run topological -> completeness -> context checks.
+    """Run topological -> completeness -> context -> granularity checks.
 
     Mutates and returns the state with updated feedback, analysis_report,
     and is_complete fields.
@@ -251,7 +314,7 @@ def analyse(state: GraphState) -> GraphState:
     report_parts = []
 
     # 1. Topological check (code-based, free)
-    logger.info("  [ANALYSER] Check 1/3: Topological (pure Python)...")
+    logger.info("  [ANALYSER] Check 1/4: Topological (pure Python)...")
     topo_report = get_graph_issues(nodes)
     report_parts.append(f"## Topological Check\n{topo_report}")
     has_topo_issues = topo_report != "Topology Valid."
@@ -261,7 +324,7 @@ def analyse(state: GraphState) -> GraphState:
         logger.info("    Topology: VALID")
 
     # 2. Completeness check (LLM-based)
-    logger.info("  [ANALYSER] Check 2/3: Completeness (LLM)...")
+    logger.info("  [ANALYSER] Check 2/4: Completeness (LLM)...")
     completeness = check_completeness(nodes, source_text)
     report_parts.append(
         f"## Completeness Check\n"
@@ -273,7 +336,7 @@ def analyse(state: GraphState) -> GraphState:
         logger.info("    Missing branches: %s", completeness.missing_branches)
 
     # 3. Context check (LLM-based)
-    logger.info("  [ANALYSER] Check 3/3: Context adjacency (LLM)...")
+    logger.info("  [ANALYSER] Check 3/4: Context adjacency (LLM)...")
     context_result = check_context(nodes, source_text)
     report_parts.append(
         f"## Context Check\n"
@@ -284,11 +347,25 @@ def analyse(state: GraphState) -> GraphState:
     if context_result["issues"]:
         logger.info("    Context issues: %s", context_result["issues"])
 
+    # 4. Granularity check (LLM-based)
+    logger.info("  [ANALYSER] Check 4/4: Granularity (LLM)...")
+    granularity = check_granularity(nodes, source_text)
+    report_parts.append(
+        f"## Granularity Check\n"
+        f"Granular: {granularity.is_granular}\n"
+        f"Coarse nodes: {[c.node_id for c in granularity.coarse_nodes]}"
+    )
+    logger.info("    Granular: %s", granularity.is_granular)
+    if granularity.coarse_nodes:
+        for c in granularity.coarse_nodes:
+            logger.info("    COARSE: %s (split→%d): %s", c.node_id, c.suggested_split, c.reason)
+
     # Aggregate: graph is complete only if ALL checks pass
     is_complete = (
         not has_topo_issues
         and completeness.is_complete
         and context_result["is_valid"]
+        and granularity.is_granular
     )
 
     # Build feedback string for the refiner
@@ -303,6 +380,12 @@ def analyse(state: GraphState) -> GraphState:
         feedback_parts.append(
             f"Context issues: {context_result['issues']}"
         )
+    if not granularity.is_granular:
+        coarse_desc = "; ".join(
+            f"'{c.node_id}' ({c.reason}, split into ~{c.suggested_split} steps)"
+            for c in granularity.coarse_nodes
+        )
+        feedback_parts.append(f"Coarse nodes needing expansion: {coarse_desc}")
 
     state["is_complete"] = is_complete
     state["feedback"] = "\n".join(feedback_parts) if feedback_parts else ""

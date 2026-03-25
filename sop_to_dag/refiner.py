@@ -1,7 +1,8 @@
-"""Refiner: triplet verification + error resolution (with RAG) + schema validation.
+"""Refiner: triplet verification + granularity expansion + error resolution + schema validation.
 
-All three components in one file. Inline prompts. TripletVerifier prioritizes
-low-confidence edges first. ErrorResolver can use FAISS for surgical fixes.
+All components in one file. Inline prompts. TripletVerifier prioritizes
+low-confidence edges first. GranularityExpander breaks coarse nodes into
+sub-steps. ErrorResolver can use FAISS for surgical fixes.
 """
 
 import json
@@ -95,6 +96,49 @@ _RESOLVER_HUMAN = """\
 
 Return the corrected node(s) as a JSON list of WorkflowNode objects.
 Only include nodes that were modified or newly created.
+"""
+
+_EXPANDER_SYSTEM = """\
+You are a Graph Expansion Specialist. You expand a COARSE workflow node into
+multiple detailed sub-steps while maintaining graph connectivity.
+
+You receive:
+1. The coarse node and its 2-hop neighborhood (nearby connected nodes)
+2. The relevant section of the original SOP
+3. The reason why the node is considered coarse
+
+Rules:
+- Break the coarse node into sequential sub-step nodes that each describe ONE
+  atomic user action
+- The FIRST replacement node must keep the same ID as the original coarse node
+  (so incoming edges still work)
+- The LAST replacement node must have its 'next' set to whatever the original
+  node's 'next' was (so outgoing edges still work)
+- If the original node was pointed to by a question node's options, the first
+  replacement inherits that connection automatically via the same ID
+- Each new intermediate node needs a descriptive snake_case ID
+- Preserve role and system metadata from the original node on all sub-steps
+  (unless the SOP indicates different roles/systems for different sub-steps)
+- All replacement nodes must be valid: instruction nodes need 'next',
+  question nodes need 'options', terminals need nothing
+"""
+
+_EXPANDER_HUMAN = """\
+## Reason for Expansion
+{reason}
+
+## Coarse Node
+{coarse_node_json}
+
+## 2-Hop Neighborhood
+{neighborhood_json}
+
+## Relevant SOP Section
+{sop_section}
+
+Return the replacement nodes as a JSON list of WorkflowNode objects.
+The first node MUST have id="{original_id}" to preserve incoming edges.
+The last node's 'next' MUST be "{original_next}" to preserve outgoing edges.
 """
 
 BATCH_SIZE = 12
@@ -204,6 +248,51 @@ class TripletVerifier:
 
 
 # ---------------------------------------------------------------------------
+# Shared graph helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_neighbors(node_id: str, nodes: Dict[str, Any]) -> List[str]:
+    """Get direct neighbors (outgoing + incoming) of a node."""
+    neighbors = []
+    data = nodes.get(node_id, {})
+
+    if data.get("next"):
+        neighbors.append(data["next"])
+    if data.get("options"):
+        neighbors.extend(data["options"].values())
+
+    for nid, ndata in nodes.items():
+        if nid == node_id:
+            continue
+        if ndata.get("next") == node_id:
+            neighbors.append(nid)
+        if ndata.get("options") and node_id in ndata["options"].values():
+            neighbors.append(nid)
+
+    return list(set(neighbors))
+
+
+def _get_2hop_neighborhood(
+    node_id: str, nodes: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Get all nodes within 2 hops of the given node."""
+    neighborhood: Dict[str, Any] = {}
+    hop1_ids = _get_neighbors(node_id, nodes)
+    neighborhood[node_id] = nodes[node_id]
+
+    for nid in hop1_ids:
+        if nid in nodes:
+            neighborhood[nid] = nodes[nid]
+            hop2_ids = _get_neighbors(nid, nodes)
+            for nid2 in hop2_ids:
+                if nid2 in nodes:
+                    neighborhood[nid2] = nodes[nid2]
+
+    return neighborhood
+
+
+# ---------------------------------------------------------------------------
 # ErrorResolver
 # ---------------------------------------------------------------------------
 
@@ -235,7 +324,7 @@ class ErrorResolver:
             if node_id not in nodes:
                 continue
 
-            neighborhood = self._get_2hop_neighborhood(node_id, nodes)
+            neighborhood = _get_2hop_neighborhood(node_id, nodes)
             issue = self._get_issue_for_node(node_id, feedback)
 
             # Enhance SOP section with RAG retrieval if available
@@ -295,44 +384,6 @@ class ErrorResolver:
             logger.warning("Resolution failed for node '%s': %s", node_id, e)
             return []
 
-    def _get_2hop_neighborhood(
-        self, node_id: str, nodes: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Get all nodes within 2 hops of the given node."""
-        neighborhood: Dict[str, Any] = {}
-        hop1_ids = self._get_neighbors(node_id, nodes)
-        neighborhood[node_id] = nodes[node_id]
-
-        for nid in hop1_ids:
-            if nid in nodes:
-                neighborhood[nid] = nodes[nid]
-                hop2_ids = self._get_neighbors(nid, nodes)
-                for nid2 in hop2_ids:
-                    if nid2 in nodes:
-                        neighborhood[nid2] = nodes[nid2]
-
-        return neighborhood
-
-    def _get_neighbors(self, node_id: str, nodes: Dict[str, Any]) -> List[str]:
-        """Get direct neighbors (outgoing + incoming) of a node."""
-        neighbors = []
-        data = nodes.get(node_id, {})
-
-        if data.get("next"):
-            neighbors.append(data["next"])
-        if data.get("options"):
-            neighbors.extend(data["options"].values())
-
-        for nid, ndata in nodes.items():
-            if nid == node_id:
-                continue
-            if ndata.get("next") == node_id:
-                neighbors.append(nid)
-            if ndata.get("options") and node_id in ndata["options"].values():
-                neighbors.append(nid)
-
-        return list(set(neighbors))
-
     def _extract_flagged_ids(
         self, feedback: str, nodes: Dict[str, Any]
     ) -> List[str]:
@@ -348,6 +399,152 @@ class ErrorResolver:
     def _get_issue_for_node(self, node_id: str, feedback: str) -> str:
         """Extract the specific issue description for a node from feedback."""
         return f"Issues related to node '{node_id}':\n{feedback}"
+
+
+# ---------------------------------------------------------------------------
+# GranularityExpander
+# ---------------------------------------------------------------------------
+
+
+class GranularityExpander:
+    """Expand coarse graph nodes into detailed sub-step sequences.
+
+    For each flagged coarse node:
+      1. Retrieves 2-hop neighborhood for context
+      2. Optionally retrieves relevant SOP section via vector store
+      3. LLM expands the node into multiple sub-steps
+      4. Replaces the original node, preserving graph connectivity
+    """
+
+    def __init__(self):
+        self.llm = get_model("resolver")  # same temp=0.1 as error resolution
+
+    def expand(
+        self,
+        nodes: Dict[str, Any],
+        feedback: str,
+        source_text: str,
+        vector_store: Any = None,
+    ) -> Tuple[Dict[str, Any], int]:
+        """Expand coarse nodes identified in feedback.
+
+        Returns (updated_nodes, count_of_expanded_nodes).
+        """
+        coarse_ids = self._extract_coarse_ids(feedback, nodes)
+        if not coarse_ids:
+            return nodes, 0
+
+        expanded_count = 0
+        for node_id, reason in coarse_ids:
+            if node_id not in nodes:
+                continue
+
+            neighborhood = _get_2hop_neighborhood(node_id, nodes)
+
+            # Retrieve relevant SOP section via vector store if available
+            sop_section = source_text
+            if vector_store is not None:
+                try:
+                    relevant_docs = vector_store.similarity_search(
+                        nodes[node_id].get("text", ""), k=2
+                    )
+                    if relevant_docs:
+                        sop_section = "\n\n".join(
+                            d.page_content for d in relevant_docs
+                        )
+                except Exception:
+                    pass
+
+            original_next = nodes[node_id].get("next")
+            replacement = self._expand_single(
+                node_id=node_id,
+                node_data=nodes[node_id],
+                neighborhood=neighborhood,
+                reason=reason,
+                sop_section=sop_section,
+                original_next=original_next,
+            )
+
+            if replacement:
+                # Remove original node and insert replacements
+                nodes.pop(node_id, None)
+                for rn in replacement:
+                    nodes[rn["id"]] = rn
+                expanded_count += 1
+
+        return nodes, expanded_count
+
+    def _expand_single(
+        self,
+        node_id: str,
+        node_data: Dict[str, Any],
+        neighborhood: Dict[str, Any],
+        reason: str,
+        sop_section: str,
+        original_next: str | None,
+    ) -> List[Dict[str, Any]]:
+        """Expand a single coarse node into sub-steps."""
+        messages = [
+            SystemMessage(content=_EXPANDER_SYSTEM),
+            HumanMessage(
+                content=_EXPANDER_HUMAN.format(
+                    reason=reason,
+                    coarse_node_json=json.dumps(node_data, indent=2),
+                    neighborhood_json=json.dumps(neighborhood, indent=2),
+                    sop_section=sop_section,
+                    original_id=node_id,
+                    original_next=original_next or "null",
+                )
+            ),
+        ]
+
+        structured_llm = self.llm.with_structured_output(_NodePatch)
+
+        try:
+            result = structured_llm.invoke(messages)
+            replacement = [n.model_dump() for n in result.nodes]
+
+            # Validate: first node must keep original ID
+            if replacement and replacement[0]["id"] != node_id:
+                replacement[0]["id"] = node_id
+
+            # Validate: last non-terminal node must point to original_next
+            if replacement and original_next:
+                last = replacement[-1]
+                if last["type"] in ("instruction", "reference") and last.get("next") != original_next:
+                    last["next"] = original_next
+
+            return replacement
+        except Exception as e:
+            logger.warning("Expansion failed for node '%s': %s", node_id, e)
+            return []
+
+    def _extract_coarse_ids(
+        self, feedback: str, nodes: Dict[str, Any]
+    ) -> List[Tuple[str, str]]:
+        """Extract (node_id, reason) pairs for coarse nodes from feedback.
+
+        Looks for the pattern: 'node_id' (reason, split into ~N steps)
+        """
+        import re
+
+        pairs = []
+        # Match the format produced by the analyser:
+        # 'node_id' (reason, split into ~N steps)
+        pattern = r"'([^']+)'\s*\(([^)]+)\)"
+        for match in re.finditer(pattern, feedback):
+            nid = match.group(1)
+            reason = match.group(2)
+            if nid in nodes:
+                pairs.append((nid, reason))
+
+        # Fallback: if no structured matches, check for any node IDs in feedback
+        if not pairs:
+            for nid in nodes:
+                if nid in feedback and "coarse" in feedback.lower():
+                    pairs.append((nid, "Flagged as coarse by analyser"))
+
+        return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +625,7 @@ class SchemaValidator:
 
 
 def refine(state: GraphState) -> GraphState:
-    """Run triplet verification -> error resolution -> schema validation.
+    """Run triplet verification -> granularity expansion -> error resolution -> schema validation.
 
     Mutates and returns the state with updated nodes and incremented iteration.
     """
@@ -441,11 +638,12 @@ def refine(state: GraphState) -> GraphState:
     vector_store = state.get("vector_store")
 
     triplet_verifier = TripletVerifier()
+    granularity_expander = GranularityExpander()
     error_resolver = ErrorResolver()
     schema_validator = SchemaValidator()
 
     # 1. Triplet verification (conditionals only, low-confidence first)
-    logger.info("  [REFINER iter %d] Step 1: Triplet verification...", iteration)
+    logger.info("  [REFINER iter %d] Step 1/4: Triplet verification...", iteration)
     invalid_triplets = triplet_verifier.verify(nodes, source_text)
     logger.info("    %d invalid triplets found", len(invalid_triplets))
     for t in invalid_triplets:
@@ -461,8 +659,21 @@ def refine(state: GraphState) -> GraphState:
         )
         feedback = f"{feedback}\n\nTriplet Issues:\n{triplet_feedback}"
 
-    # 2. Error resolution (surgical LLM edits, with optional RAG)
-    logger.info("  [REFINER iter %d] Step 2: Error resolution...", iteration)
+    # 2. Granularity expansion (break coarse nodes into sub-steps)
+    logger.info("  [REFINER iter %d] Step 2/4: Granularity expansion...", iteration)
+    if "coarse" in feedback.lower():
+        nodes_before = len(nodes)
+        nodes, expanded_count = granularity_expander.expand(
+            nodes, feedback, source_text, vector_store
+        )
+        nodes_after = len(nodes)
+        logger.info("    Expanded %d coarse nodes. Nodes: %d -> %d (delta: %+d)",
+                     expanded_count, nodes_before, nodes_after, nodes_after - nodes_before)
+    else:
+        logger.info("    No coarse nodes flagged — skipping")
+
+    # 3. Error resolution (surgical LLM edits, with optional RAG)
+    logger.info("  [REFINER iter %d] Step 3/4: Error resolution...", iteration)
     if feedback.strip():
         nodes_before = len(nodes)
         nodes = error_resolver.resolve(nodes, feedback, source_text, vector_store)
@@ -471,8 +682,8 @@ def refine(state: GraphState) -> GraphState:
     else:
         logger.info("    No feedback to resolve — skipping")
 
-    # 3. Schema validation (deterministic fixes)
-    logger.info("  [REFINER iter %d] Step 3: Schema validation...", iteration)
+    # 4. Schema validation (deterministic fixes)
+    logger.info("  [REFINER iter %d] Step 4/4: Schema validation...", iteration)
     nodes, fix_msgs = schema_validator.validate_and_fix(nodes)
     if fix_msgs:
         for msg in fix_msgs:

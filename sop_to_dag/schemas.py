@@ -81,6 +81,25 @@ class RefineFeedback(BaseModel):
     )
 
 
+class CoarseNode(BaseModel):
+    """A graph node flagged as too coarse — collapses multiple actions."""
+
+    node_id: str = Field(description="ID of the node that is too coarse.")
+    reason: str = Field(description="Why this node needs expansion.")
+    suggested_split: int = Field(
+        description="Suggested number of sub-steps this node should become."
+    )
+
+
+class GranularityFeedback(BaseModel):
+    """Feedback from the analyser about node-level granularity."""
+
+    is_granular: bool = Field(
+        description="Whether all nodes are sufficiently granular."
+    )
+    coarse_nodes: List[CoarseNode] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # Intermediate models (pipeline stages)
 # ---------------------------------------------------------------------------
