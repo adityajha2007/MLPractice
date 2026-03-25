@@ -11,7 +11,7 @@ Raw SOP --> preprocessing --> [enriched chunks + entity map + FAISS index]
                     |                                    |
              MAIN PATH                        COMPARISON ONLY
              PipelineConverter                BottomUp / EdgeVertex
-             (3.5-stage: LLM+deterministic)  (produce graph for eval)
+             (3-stage: LLM+deterministic)    (produce graph for eval)
                     |
              Refinement Loop
              (Analyser <-> Refiner)
@@ -27,7 +27,7 @@ sop_to_dag/
   models.py           # LLM + embedding model factories
   storage.py          # GraphStore (file-based JSON persistence)
   preprocessing.py    # Chunking + FAISS indexing + RAG enrichment + entity resolution
-  converter.py        # Main 3.5-stage pipeline (TopDown -> CodeBased -> Merge -> Deterministic Graph)
+  converter.py        # Main 3-stage pipeline (Outline -> Detail Pass -> Direct Text-to-Graph)
   alternatives.py     # Research paper comparisons: BottomUp, EdgeVertex
   analyser.py         # Topological + completeness + context checks
   refiner.py          # Triplet verification + error resolver + schema validator
@@ -48,6 +48,7 @@ sop_to_dag/
     test_validator.py
     test_metrics.py
     test_graph_builder.py
+    test_outline_parser.py
 ```
 
 ## Setup
@@ -110,12 +111,11 @@ A 4-node LangGraph pipeline that always runs before conversion:
 
 ### 2. Conversion (`converter.py`)
 
-3.5-stage pipeline — LLM narrows ambiguity, then deterministic compilation:
+3-stage pipeline — LLM produces plain text, then deterministic compilation:
 
-- **Stage 0 (Overview)** -- LLM extracts a lightweight ProcedureOverview: goal, phase names, cross-phase decision gates
-- **Stage 1 (Per-Chunk Pseudocode)** -- LLM converts each enriched chunk into a Procedure (structured pseudocode with IF/ELSE blocks, sequential actions, pre/postconditions) with carryover from the previous chunk for continuity
-- **Stage 2 (Merge)** -- LLM reconciles assembled pseudocode with the **original document** line-by-line to capture every granular detail (specific codes, team names, thresholds, references) the skeleton may have missed
-- **Stage 3 (Deterministic Graph Build)** -- Pure Python tree walk compiles the merged pseudocode into WorkflowNodes. `ActionStep -> instruction`, `ConditionalBlock -> question`, end states -> `terminal`. No LLM involved — zero hallucination risk
+- **Step 1 (Outline)** -- LLM converts the full enriched SOP into a plain-text numbered outline with `DECISION:` prefixed decision points, indented `YES:`/`NO:` branches, and self-explanatory step text
+- **Step 2 (Detail Pass)** -- For each enriched chunk, LLM verifies the outline captures every detail from that section, adding any missing actions, decisions, references, or specific values (codes, team names, thresholds)
+- **Step 3 (Direct Text-to-Graph)** -- Pure Python parser reads the outline and emits graph nodes directly — `numbered step -> instruction`, `DECISION: -> question`, terminal keywords -> `terminal`. No intermediate Pydantic models, no LLM — zero hallucination risk
 
 ### 3. Refinement Loop (`loop.py`)
 
