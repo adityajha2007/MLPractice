@@ -14,7 +14,10 @@ from pathlib import Path
 
 from sop_to_dag.converter import PipelineConverter
 from sop_to_dag.loop import run_refinement
-from sop_to_dag.preprocessing import run_preprocessing
+from sop_to_dag.preprocessing_cache import (
+    cached_preprocessing,
+    rebuild_vector_store,
+)
 from sop_to_dag.schemas import GraphState
 from sop_to_dag.storage import GraphStore
 
@@ -38,43 +41,6 @@ def _dump_preprocessing(run_dir: Path, prep_state: dict) -> None:
     (run_dir / "prep_entity_map.json").write_text(
         json.dumps(prep_state["entity_map"], indent=2)
     )
-
-
-def _load_preprocessing(run_dir: Path) -> dict | None:
-    """Load cached preprocessing outputs from a previous run directory.
-
-    Returns a dict with chunks, enriched_chunks, entity_map, and
-    vector_store=None (must be rebuilt if needed). Returns None if
-    any required file is missing.
-    """
-    chunks_path = run_dir / "prep_chunks.json"
-    enriched_path = run_dir / "prep_enriched_chunks.json"
-    entity_path = run_dir / "prep_entity_map.json"
-
-    if not all(p.exists() for p in [chunks_path, enriched_path, entity_path]):
-        return None
-
-    return {
-        "chunks": json.loads(chunks_path.read_text()),
-        "enriched_chunks": json.loads(enriched_path.read_text()),
-        "entity_map": json.loads(entity_path.read_text()),
-        "vector_store": None,  # not serializable; rebuilt if needed
-    }
-
-
-def _rebuild_vector_store(prep_state: dict) -> None:
-    """Rebuild the FAISS vector store from cached chunks (for refinement RAG)."""
-    from langchain_community.vectorstores import FAISS
-    from sop_to_dag.models import get_embeddings
-
-    chunks = prep_state["chunks"]
-    if not chunks:
-        return
-
-    texts = [c["text"] for c in chunks]
-    metadatas = [{"chunk_id": c["chunk_id"], "title": c["title"]} for c in chunks]
-    embeddings = get_embeddings()
-    prep_state["vector_store"] = FAISS.from_texts(texts, embeddings, metadatas=metadatas)
 
 
 def _setup_logging(run_dir: Path) -> None:
@@ -117,6 +83,11 @@ def main():
         default=None,
         help="Path to a previous run directory to resume from (skips cached stages).",
     )
+    parser.add_argument(
+        "--force-preprocess",
+        action="store_true",
+        help="Bypass preprocessing cache and re-run from scratch.",
+    )
     args = parser.parse_args()
 
     sop_path = Path(args.sop_file)
@@ -141,18 +112,14 @@ def main():
     print(f"Stage dumps: {run_dir}")
     is_resume = args.resume is not None
 
-    # Phase 0: Preprocessing
+    # Phase 0: Preprocessing (content-based cache)
     print("=== PREPROCESSING ===")
-    cached_prep = _load_preprocessing(run_dir) if is_resume else None
-    if cached_prep:
-        print("Loaded preprocessing from cache.")
-        prep_state = cached_prep
-        # Rebuild FAISS for refinement RAG lookups
-        print("Rebuilding FAISS vector store from cached chunks...")
-        _rebuild_vector_store(prep_state)
-    else:
-        prep_state = run_preprocessing(source_text)
-        _dump_preprocessing(run_dir, prep_state)
+    prep_state = cached_preprocessing(
+        source_text,
+        force=args.force_preprocess,
+        rebuild_faiss=True,
+    )
+    _dump_preprocessing(run_dir, prep_state)
     print(f"Chunks: {len(prep_state['chunks'])}")
     print(f"Enriched chunks: {len(prep_state['enriched_chunks'])}")
     print(f"Entity mappings: {len(prep_state['entity_map'])}")

@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from sop_to_dag.converter import PipelineConverter
-from sop_to_dag.preprocessing import run_preprocessing
+from sop_to_dag.preprocessing_cache import cached_preprocessing
 from sop_to_dag.schemas import GraphState
 from sop_to_dag.storage import GraphStore
 
@@ -37,23 +37,6 @@ def _dump_preprocessing(run_dir: Path, prep_state: dict) -> None:
     (run_dir / "prep_entity_map.json").write_text(
         json.dumps(prep_state["entity_map"], indent=2)
     )
-
-
-def _load_preprocessing(run_dir: Path) -> dict | None:
-    """Load cached preprocessing outputs. Returns None if files missing."""
-    chunks_path = run_dir / "prep_chunks.json"
-    enriched_path = run_dir / "prep_enriched_chunks.json"
-    entity_path = run_dir / "prep_entity_map.json"
-
-    if not all(p.exists() for p in [chunks_path, enriched_path, entity_path]):
-        return None
-
-    return {
-        "chunks": json.loads(chunks_path.read_text()),
-        "enriched_chunks": json.loads(enriched_path.read_text()),
-        "entity_map": json.loads(entity_path.read_text()),
-        "vector_store": None,
-    }
 
 
 def _setup_logging(run_dir: Path) -> None:
@@ -96,6 +79,11 @@ def main():
         default=None,
         help="Path to a previous run directory to resume from (skips cached stages).",
     )
+    parser.add_argument(
+        "--force-preprocess",
+        action="store_true",
+        help="Bypass preprocessing cache and re-run from scratch.",
+    )
     args = parser.parse_args()
 
     sop_path = Path(args.sop_file)
@@ -120,15 +108,14 @@ def main():
     print(f"Stage dumps: {run_dir}")
     is_resume = args.resume is not None
 
-    # Preprocessing: chunk + RAG enrich + entity resolution
+    # Preprocessing: chunk + RAG enrich + entity resolution (content-based cache)
     print(f"Preprocessing: {sop_path.name}")
-    cached_prep = _load_preprocessing(run_dir) if is_resume else None
-    if cached_prep:
-        print("  Loaded preprocessing from cache.")
-        prep_state = cached_prep
-    else:
-        prep_state = run_preprocessing(source_text)
-        _dump_preprocessing(run_dir, prep_state)
+    prep_state = cached_preprocessing(
+        source_text,
+        force=args.force_preprocess,
+        rebuild_faiss=False,  # converter doesn't need FAISS
+    )
+    _dump_preprocessing(run_dir, prep_state)
     print(f"  Chunks: {len(prep_state['chunks'])}")
     print(f"  Entity mappings: {len(prep_state['entity_map'])}")
 

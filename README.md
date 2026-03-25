@@ -26,11 +26,12 @@ sop_to_dag/
   schemas.py          # All Pydantic models + TypedDicts
   models.py           # LLM + embedding model factories
   storage.py          # GraphStore (file-based JSON persistence)
-  preprocessing.py    # Chunking + FAISS indexing + RAG enrichment + entity resolution
-  converter.py        # Main 3-stage pipeline (Outline -> Detail Pass -> Direct Text-to-Graph)
+  preprocessing.py        # Chunking + FAISS indexing + RAG enrichment + entity resolution
+  preprocessing_cache.py  # Content-based preprocessing cache (SHA-256 keyed)
+  converter.py             # Main 3-stage pipeline (Outline -> Detail Pass -> Direct Text-to-Graph)
   alternatives.py     # Research paper comparisons: BottomUp, EdgeVertex
-  analyser.py         # Topological + completeness + context checks
-  refiner.py          # Triplet verification + error resolver + schema validator
+  analyser.py         # Topological + completeness + context + granularity checks
+  refiner.py          # Triplet verification + granularity expander + error resolver + schema validator
   loop.py             # LangGraph StateGraph: Analyser <-> Refiner loop
   evaluation.py       # Metrics (node count, edge coverage, structural similarity)
   scripts/
@@ -92,6 +93,33 @@ python -m sop_to_dag.scripts.run_refinement output/graphs/<graph_file>.json
 python -m sop_to_dag.scripts.compare_converters sop_to_dag/tests/fixtures/sample_sop_fraud.md
 ```
 
+### Caching and resuming
+
+Preprocessing results (chunking, RAG enrichment, entity resolution) are automatically cached by SHA-256 of the SOP content. Subsequent runs for the same document skip preprocessing entirely.
+
+```bash
+# First run — preprocessing runs and is cached automatically
+python -m sop_to_dag.scripts.run_full_pipeline sop_to_dag/tests/fixtures/sample_sop_fraud.md
+
+# Second run (same SOP) — preprocessing is skipped, straight to conversion
+python -m sop_to_dag.scripts.run_full_pipeline sop_to_dag/tests/fixtures/sample_sop_fraud.md
+
+# Resume a specific run (reuses preprocessing cache + outline/detail pass from that run)
+python -m sop_to_dag.scripts.run_full_pipeline sop_to_dag/tests/fixtures/sample_sop_fraud.md \
+  --resume output/stage_dumps/sample_sop_fraud_20260326_150000
+
+# Force re-run preprocessing (e.g., after changing the chunking prompt)
+python -m sop_to_dag.scripts.run_full_pipeline sop_to_dag/tests/fixtures/sample_sop_fraud.md \
+  --force-preprocess
+```
+
+There are two caching layers:
+
+| Layer | Location | Keyed by | Automatic | What it caches |
+|-------|----------|----------|-----------|----------------|
+| Preprocessing cache | `output/preprocessing_cache/` | SOP content hash | Yes | Chunks, enriched chunks, entity map |
+| Run resume (`--resume`) | `output/stage_dumps/<run_dir>/` | Run directory path | Manual | Outline, refined outline, preprocessing dumps |
+
 ### Run tests
 
 ```bash
@@ -108,21 +136,22 @@ A 4-node LangGraph pipeline that always runs before conversion:
 - **FAISS indexing** -- Embeds chunks using HuggingFace bge-base-en-v1.5 (local, no API cost)
 - **RAG enrichment** -- For each chunk, generates queries for dangling references, retrieves from FAISS, grades relevance, keeps valid context
 - **Entity resolution** -- Groups synonymous terms (e.g., "CBRD team" / "Credit Bureau Reporting Disputes team") into canonical forms and normalizes all chunk text
+- **Content-based cache** -- Results are cached by SHA-256 of the SOP content. Subsequent runs for the same document skip preprocessing entirely. Use `--force-preprocess` to bypass.
 
 ### 2. Conversion (`converter.py`)
 
 3-stage pipeline — LLM produces plain text, then deterministic compilation:
 
-- **Step 1 (Outline)** -- LLM converts the full enriched SOP into a plain-text numbered outline with `DECISION:` prefixed decision points, indented `YES:`/`NO:` branches, and self-explanatory step text
-- **Step 2 (Detail Pass)** -- For each enriched chunk, LLM verifies the outline captures every detail from that section, adding any missing actions, decisions, references, or specific values (codes, team names, thresholds)
-- **Step 3 (Direct Text-to-Graph)** -- Pure Python parser reads the outline and emits graph nodes directly — `numbered step -> instruction`, `DECISION: -> question`, terminal keywords -> `terminal`. No intermediate Pydantic models, no LLM — zero hallucination risk
+- **Step 1 (Outline)** -- LLM converts the full enriched SOP into a plain-text numbered outline with `DECISION:` prefixed decision points, indented `YES:`/`NO:` branches, self-explanatory step text, and `[Role: X]`/`[System: Y]` metadata tags
+- **Step 2 (Detail Pass)** -- For each enriched chunk (with sliding window prev/next context), LLM verifies the outline captures every detail from that section — can add missing steps or expand coarse steps into sub-steps
+- **Step 3 (Direct Text-to-Graph)** -- Pure Python parser reads the outline, strips metadata tags into `role`/`system` node fields, and emits graph nodes directly — `numbered step -> instruction`, `DECISION: -> question`, terminal keywords -> `terminal`. No intermediate Pydantic models, no LLM — zero hallucination risk
 
 ### 3. Refinement Loop (`loop.py`)
 
 LangGraph StateGraph cycling between analysis and repair:
 
-- **Analyser** -- Topological checks (pure Python), completeness check (LLM), context check (LLM)
-- **Refiner** -- Triplet verification (prioritizes low-confidence edges), error resolution (2-hop neighborhood + optional FAISS RAG), schema validation (deterministic fixes)
+- **Analyser** -- Topological checks (pure Python), completeness check (LLM), context check (LLM), granularity check (LLM — flags coarse nodes that collapse multiple actions)
+- **Refiner** -- Triplet verification (prioritizes low-confidence edges), granularity expansion (breaks coarse nodes into sub-steps), error resolution (2-hop neighborhood + optional FAISS RAG), schema validation (deterministic fixes)
 - Loops until all checks pass or max iterations reached
 
 ### 4. Alternative Converters (`alternatives.py`)

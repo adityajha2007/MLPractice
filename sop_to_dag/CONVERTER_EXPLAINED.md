@@ -70,7 +70,9 @@ The LLM reads the full SOP and produces a numbered outline that captures the com
 
 **Why plain text instead of structured output:** The LLM produces better outlines when it can write freely in a simple numbered format. No schema wrestling, no field-level hallucination. The deterministic parser in Step 3 handles all the structuring.
 
-**Prompt role:** `Process Logic Engineer` — focuses on capturing the COMPLETE workflow with self-explanatory step text, all decision paths covered, and cross-section references inlined.
+**Metadata tags:** The LLM appends `[Role: <who>]` and `[System: <tool>]` tags to each step when applicable. Example: `1. Click the 'Dispute' tab [Role: Analyst] [System: Mainframe]`. These tags are parsed out and stored as `role`/`system` fields on graph nodes in Step 3.
+
+**Prompt role:** `Process Logic Engineer` — focuses on capturing the COMPLETE workflow with highly detailed micro-operations, all decision paths covered, cross-section references inlined, and metadata tags for roles/systems.
 
 ---
 
@@ -83,10 +85,14 @@ The LLM reads the full SOP and produces a numbered outline that captures the com
 Each enriched chunk is compared against the current outline. The LLM checks if every action, decision, reference, and detail from that section is captured, and adds anything missing in the correct location.
 
 **Rules:**
-1. Do NOT remove or restructure existing steps — only ADD
+1. Do NOT remove existing steps — you MAY expand a single coarse step into multiple detailed sub-steps if the SOP section describes multiple distinct actions collapsed into one line
 2. If the section references external documents not in the outline — add them
 3. Return the COMPLETE updated outline (all existing steps + additions)
 4. If nothing is missing, return the outline unchanged
+5. Insert orphaned context in the correct position based on process flow — do NOT append disconnected steps to the end
+6. Use the previous and next section context to understand where the current section fits
+
+**Sliding window context:** Each detail pass call receives the previous and next chunk text alongside the current chunk, giving the LLM context about where this section fits in the overall process flow. This prevents orphaned steps from being appended to the end of the outline.
 
 **Why this step exists:** The single-shot outline in Step 1 captures the overall structure well, but may miss specific codes, team names, threshold values, or cross-references that appear in individual SOP sections. The detail pass is a "diff and patch" that ensures no granular detail is lost.
 
@@ -110,10 +116,12 @@ The parser (`_parse_and_emit`) walks lines recursively:
 
 | Outline pattern | What happens |
 |---|---|
-| `3. Do something` | Calls `builder._emit_action("Do something")` |
+| `3. Do something [Role: Analyst] [System: CRM]` | Extracts `role`/`system` tags, strips them from text, calls `builder._emit_action("Do something", role="Analyst", system="CRM")` |
 | `4. DECISION: Is it valid?` | Parses YES/NO branches recursively, then calls `builder._emit_conditional(...)` |
 | `YES:` / `NO:` | Branch markers — triggers recursive sub-parse at deeper indent |
 | `5. Update status` (after un-indent) | Convergence — chained after the decision's branch tails |
+
+**Metadata tag extraction:** Before checking for DECISION prefix, the parser extracts `[Role: X]` and `[System: Y]` tags using narrow regex (`\[(?:Role|System):\s*.*?\]`). This avoids stripping legitimate bracket content like `[Cross-reference context: ...]`. The cleaned text is used for node text and ID generation; the extracted values are stored as `role`/`system` fields on the node.
 
 ### Mapping Rules
 
@@ -265,7 +273,9 @@ The final output is a Python dict mapping node IDs to node data:
     "next": "is_code_183_question",
     "options": null,
     "external_ref": null,
-    "confidence": "high"
+    "confidence": "high",
+    "role": "Analyst",
+    "system": "Case Management System"
   },
   "is_code_183_question": {
     "id": "is_code_183_question",
@@ -274,19 +284,21 @@ The final output is a Python dict mapping node IDs to node data:
     "next": null,
     "options": {"Yes": "route_to_fraud", "No": "route_to_standard"},
     "external_ref": null,
-    "confidence": "high"
+    "confidence": "high",
+    "role": "Analyst",
+    "system": "Mainframe"
   }
 }
 ```
 
 ### Node Types
 
-| Type | `next` | `options` | Description |
-|---|---|---|---|
-| `instruction` | Required (node_id) | null | A step to execute |
-| `question` | null | Required (`{"Yes": id, "No": id}`) | A decision point |
-| `terminal` | null | null | End state |
-| `reference` | Required (node_id) | null | Like instruction, but references external doc |
+| Type | `next` | `options` | `role` | `system` | Description |
+|---|---|---|---|---|---|
+| `instruction` | Required (node_id) | null | Optional | Optional | A step to execute |
+| `question` | null | Required (`{"Yes": id, "No": id}`) | Optional | Optional | A decision point |
+| `terminal` | null | null | null | null | End state |
+| `reference` | Required (node_id) | null | Optional | Optional | Like instruction, but references external doc |
 
 ---
 
@@ -304,7 +316,7 @@ These are retained for tests and backward compatibility but are no longer used i
 
 1. **Plain-text outline as the LLM's only job.** The LLM writes a simple numbered list — no schema wrestling, no field-level hallucination. The format is natural for the model to produce and trivial for deterministic code to parse.
 
-2. **Detail pass ensures granularity.** The chunk-by-chunk verification catches specific codes, team names, and threshold values the single-shot outline may have glossed over. The outline grows more detailed with each pass.
+2. **Detail pass ensures granularity.** The chunk-by-chunk verification (with sliding window prev/next context) catches specific codes, team names, and threshold values the single-shot outline may have glossed over. It can also expand coarse steps into sub-steps. The outline grows more detailed with each pass.
 
 3. **Direct text-to-graph with no intermediate models.** `parse_outline_to_graph` reads text and emits graph nodes in one pass. No `PseudocodeBlock` construction means no ~50+ Pydantic model instances allocated and immediately discarded.
 
