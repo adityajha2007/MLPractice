@@ -29,6 +29,8 @@ class WorkflowNode(BaseModel):
         default=None, description="Map of answer->next_node_id."
     )
     external_ref: Optional[str] = Field(default=None)
+    role: Optional[str] = Field(default=None, description="Who performs this action.")
+    system: Optional[str] = Field(default=None, description="Software or tool used.")
     confidence: Literal["high", "medium", "low"] = Field(
         default="high",
         description=(

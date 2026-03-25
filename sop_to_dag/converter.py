@@ -60,13 +60,13 @@ FORMAT RULES (follow exactly):
 - External references: include "Refer to: <document name>" in the step text
 
 CONTENT RULES:
-1. Each step must be self-explanatory — include the system, entity, or document
-   name directly. A reader should understand the full action without any context.
-2. Keep steps BROAD — one step per meaningful business action or decision.
-   Do NOT split a single SOP step into micro-operations.
+1. Break the process down into HIGHLY DETAILED micro-operations. Capture every specific action.
+2. For every step or decision, append metadata tags at the end of the line if applicable:
+   - [Role: <who does this>]
+   - [System: <software or tool used>]
+   Example: 1. Click the 'Dispute' tab [Role: Analyst] [System: Mainframe]
 3. Cover ALL decision paths — every branch must lead somewhere.
-4. Cross-section references (e.g., "proceed to fraud resolution") must be
-   inlined as actual steps inside the relevant branch.
+4. Cross-section references must be inlined as actual steps inside the relevant branch.
 5. Preserve ALL detail from the SOP — every decision, action, and reference.
 6. Do NOT add preamble, headers, or commentary. Output ONLY the numbered outline.
 """
@@ -93,6 +93,13 @@ Your job:
 4. If the section references external documents/guides not in the outline — add them
 5. Do NOT remove or restructure existing steps
 6. Do NOT add steps that aren't in the SOP section
+7. If a chunk contains an action but the condition/decision for that action is
+   missing, look at the current outline to infer where it belongs based on
+   surrounding process steps.
+8. Do NOT connect disconnected steps to the end of the outline — insert orphaned
+   context in the correct position based on process flow.
+9. Use the Previous and Next Section Context to understand where the current
+   section fits in the overall process flow.
 
 Return the COMPLETE updated outline (all existing steps + any additions).
 If nothing is missing, return the outline unchanged.
@@ -105,8 +112,14 @@ _DETAIL_PASS_HUMAN = """\
 ## Current Outline
 {current_outline}
 
+## Previous Section Context (for reference only)
+{prev_context}
+
 ## SOP Section to Verify
 {chunk_text}
+
+## Next Section Context (for reference only)
+{next_context}
 
 Return the complete updated outline with any missing details added.
 """
@@ -375,7 +388,14 @@ def _parse_and_emit(
         step_text = step_match.group(2).strip()
         use_id = force_first_id if (not results and force_first_id) else None
 
-        decision_match = re.match(r"^DECISION:\s*(.*)", step_text, re.IGNORECASE)
+        # Extract metadata tags
+        role_match = re.search(r"\[Role:\s*(.*?)\]", step_text, re.IGNORECASE)
+        system_match = re.search(r"\[System:\s*(.*?)\]", step_text, re.IGNORECASE)
+        role = role_match.group(1).strip() if role_match else None
+        system = system_match.group(1).strip() if system_match else None
+        clean_text = re.sub(r"\[(?:Role|System):\s*.*?\]", "", step_text, flags=re.IGNORECASE).strip()
+
+        decision_match = re.match(r"^DECISION:\s*(.*)", clean_text, re.IGNORECASE)
         if decision_match:
             condition = decision_match.group(1).strip()
             cond_id = _to_snake_case(condition)
@@ -396,14 +416,19 @@ def _parse_and_emit(
                 true_result=true_result,
                 false_result=false_result,
                 forced_id=use_id,
+                role=role,
+                system=system,
             )
             results.append(result)
         else:
-            step_id = _to_snake_case(step_text)
+            action_text = clean_text
+            step_id = _to_snake_case(action_text)
             result = builder._emit_action(
-                action_text=step_text,
+                action_text=action_text,
                 action_id=step_id,
                 forced_id=use_id,
+                role=role,
+                system=system,
             )
             results.append(result)
             i += 1
@@ -577,6 +602,8 @@ class _GraphBuilder:
         action_id: str | None = None,
         target: str | None = None,
         forced_id: str | None = None,
+        role: str | None = None,
+        system: str | None = None,
     ) -> _BuildResult:
         base_id = forced_id or action_id or _to_snake_case(action_text)
         node_id = forced_id or self._unique_id(base_id)
@@ -606,6 +633,8 @@ class _GraphBuilder:
             "options": None,
             "external_ref": external_ref,
             "confidence": "high",
+            "role": role,
+            "system": system,
         }
         return node_id, [node_id]
 
@@ -616,6 +645,8 @@ class _GraphBuilder:
         true_result: _BuildResult = (None, []),
         false_result: _BuildResult = (None, []),
         forced_id: str | None = None,
+        role: str | None = None,
+        system: str | None = None,
     ) -> _BuildResult:
         base_id = forced_id or cond_id or _to_snake_case(condition)
         node_id = forced_id or self._unique_id(base_id)
@@ -642,6 +673,8 @@ class _GraphBuilder:
             "options": {"Yes": true_head, "No": false_head},
             "external_ref": None,
             "confidence": "high",
+            "role": role,
+            "system": system,
         }
         return node_id, true_tails + false_tails
 
@@ -650,7 +683,7 @@ class _GraphBuilder:
         self.nodes[nid] = {
             "id": nid, "type": "terminal", "text": text,
             "next": None, "options": None, "external_ref": None,
-            "confidence": "high",
+            "confidence": "high", "role": None, "system": None,
         }
         return nid
 
@@ -786,6 +819,10 @@ class PipelineConverter:
             if ctx:
                 chunk_text += f"\n\n[Cross-reference context: {ctx}]"
 
+            # Sliding window: provide prev/next chunk text for context
+            prev_context = enriched_chunks[idx - 2].get("chunk_text", "") if idx >= 2 else ""
+            next_context = enriched_chunks[idx].get("chunk_text", "") if idx < len(enriched_chunks) else ""
+
             logger.info("  Detail pass %d/%d (chunk %s)...",
                         idx, total, ec.get("chunk_id", idx - 1))
             try:
@@ -795,6 +832,8 @@ class PipelineConverter:
                     human=_DETAIL_PASS_HUMAN,
                     current_outline=current,
                     chunk_text=chunk_text,
+                    prev_context=prev_context,
+                    next_context=next_context,
                 )
                 # Basic sanity: the updated outline shouldn't be drastically shorter
                 if len(updated.strip().split("\n")) >= len(current.strip().split("\n")) * 0.7:
