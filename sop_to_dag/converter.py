@@ -10,7 +10,6 @@ history that indentation-based outlines lose.
 
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -191,17 +190,6 @@ List every detail you extract and its coverage status before producing the patch
 # ---------------------------------------------------------------------------
 
 
-def _llm_call(stage: str, system: str, human: str, **format_kwargs) -> str:
-    """Plain-text LLM call (no structured output). Returns raw text response."""
-    llm = get_model(stage)
-    messages = [
-        SystemMessage(content=system),
-        HumanMessage(content=human.format(**format_kwargs)),
-    ]
-    response = safe_invoke(llm, messages, context=f"llm_call/{stage}")
-    return response.content.strip()
-
-
 def _structured_llm_call(
     stage: str, schema, system: str, human: str, **format_kwargs
 ):
@@ -217,13 +205,6 @@ def _structured_llm_call(
         HumanMessage(content=human.format(**format_kwargs)),
     ]
     return safe_invoke(structured_llm, messages, context=f"structured/{stage}")
-
-
-def _to_snake_case(text: str) -> str:
-    """Convert a text description to a snake_case node ID."""
-    words = re.sub(r"[^a-zA-Z0-9\s]", "", text).lower().split()[:4]
-    slug = "_".join(words)
-    return slug or "node"
 
 
 def _reassemble_sop(

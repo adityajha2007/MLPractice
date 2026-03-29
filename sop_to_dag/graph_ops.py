@@ -22,7 +22,6 @@ from pydantic import BaseModel, Field
 
 from sop_to_dag.models import get_model, safe_invoke
 from sop_to_dag.schemas import (
-    GranularityFeedback,
     GraphPatch,
     GraphState,
     RefineFeedback,
@@ -89,11 +88,8 @@ _COMPLETENESS_HUMAN = """\
 ## Original SOP
 {source_text}
 
-## Graph Adjacency Map
-{adjacency_map}
-
-## Current Nodes (JSON)
-{nodes_json}
+## Current Graph Nodes
+{nodes_compact}
 
 Evaluate completeness. Return RefineFeedback with is_complete and missing_branches.
 """
@@ -115,51 +111,11 @@ _CONTEXT_HUMAN = """\
 ## Original SOP
 {source_text}
 
-## Graph Adjacency Map
-{adjacency_map}
-
-## Current Nodes (JSON)
-{nodes_json}
+## Current Graph Nodes
+{nodes_compact}
 
 Evaluate logical adjacency of connected nodes. Return a ContextFeedback with
 is_valid and issues.
-"""
-
-_GRANULARITY_SYSTEM = """\
-You are a Process Granularity Auditor. Your job is to compare each non-terminal
-node in a workflow graph against the original SOP and identify nodes that are
-TOO COARSE — i.e., a single node that collapses multiple distinct user actions
-into one step.
-
-A node is "coarse" when:
-- The corresponding SOP text describes 2 or more SEPARATE actions that a user
-  must perform sequentially (e.g., "Open the system, navigate to the tab, and
-  enter the data" is 3 actions crammed into one node).
-- The node text uses conjunctions like "and", "then", or semicolons to join
-  multiple operations.
-- The SOP section for this step contains sub-bullets, numbered sub-steps, or
-  multiple imperative verbs describing distinct operations.
-
-A node is NOT coarse when:
-- It describes a single atomic action (even if the text is long for clarity).
-- It is a decision/question node asking one question.
-- It is a terminal or reference node.
-
-For each coarse node, estimate how many sub-steps it should be split into.
-Be conservative — only flag nodes where the SOP clearly describes multiple
-distinct actions. Do not flag nodes just because they could theoretically be
-more detailed.
-"""
-
-_GRANULARITY_HUMAN = """\
-## Original SOP
-{source_text}
-
-## Current Nodes (JSON)
-{nodes_json}
-
-Identify coarse nodes. Return GranularityFeedback with is_granular and
-coarse_nodes (each with node_id, reason, suggested_split).
 """
 
 
@@ -195,10 +151,9 @@ You are a Graph Repair Specialist. You fix issues in workflow graphs by \
 producing a structured patch (add/modify/remove operations).
 
 You receive:
-1. The full current graph as an adjacency map and full JSON
+1. The full current graph as JSON (all node fields included)
 2. The original SOP text
-3. A detailed list of issues found by the analyser (missing branches, \
-invalid triplets, coarse nodes, topological problems, context issues)
+3. A specific list of issues to fix (from the analyser)
 
 Your job: produce a GraphPatch that fixes ALL the listed issues while \
 preserving everything that is already correct.
@@ -233,9 +188,6 @@ Node schema reminder:
 _PATCH_RESOLVER_HUMAN = """\
 ## Original SOP
 {source_text}
-
-## Current Graph (Adjacency Map)
-{adjacency_map}
 
 ## Current Graph (Full Nodes JSON)
 {nodes_json}
@@ -313,6 +265,33 @@ def generate_adjacency_map(nodes: Dict[str, Any]) -> str:
                     targets.append(f"--({k})--> {v}")
             lines.append(f"{n_id} {' '.join(targets)}")
 
+    return "\n".join(lines)
+
+
+def compact_nodes_repr(nodes: Dict[str, Any]) -> str:
+    """Compact text representation of nodes for analyser LLM calls.
+
+    Includes id, type, text, and connections — drops null fields.
+    ~60-70% smaller than full JSON, enough for completeness/context checks.
+    Full JSON is only needed by the resolver (which produces patches).
+    """
+    lines: List[str] = []
+    for n_id, data in nodes.items():
+        parts = [f"[{n_id}] ({data.get('type', '?')}) \"{data.get('text', '')}\""]
+        if data.get("next"):
+            parts.append(f"next={data['next']}")
+        if data.get("options"):
+            opts = ", ".join(f"{k}:{v}" for k, v in data["options"].items())
+            parts.append(f"options={{{opts}}}")
+        if data.get("role"):
+            parts.append(f"role={data['role']}")
+        if data.get("system"):
+            parts.append(f"system={data['system']}")
+        if data.get("external_ref"):
+            parts.append(f"ref={data['external_ref']}")
+        if data.get("confidence") and data["confidence"] != "high":
+            parts.append(f"confidence={data['confidence']}")
+        lines.append(" | ".join(parts))
     return "\n".join(lines)
 
 
@@ -400,8 +379,7 @@ def _get_2hop_neighborhood(
 
 def check_completeness(nodes: dict, source_text: str) -> RefineFeedback:
     """LLM check: graph vs source text alignment."""
-    adjacency_map = generate_adjacency_map(nodes)
-    nodes_json = json.dumps(nodes, indent=2)
+    nodes_compact = compact_nodes_repr(nodes)
 
     llm = get_model("completeness")
     structured_llm = llm.with_structured_output(RefineFeedback)
@@ -410,8 +388,7 @@ def check_completeness(nodes: dict, source_text: str) -> RefineFeedback:
         HumanMessage(
             content=_COMPLETENESS_HUMAN.format(
                 source_text=source_text,
-                adjacency_map=adjacency_map,
-                nodes_json=nodes_json,
+                nodes_compact=nodes_compact,
             )
         ),
     ]
@@ -420,8 +397,7 @@ def check_completeness(nodes: dict, source_text: str) -> RefineFeedback:
 
 def check_context(nodes: dict, source_text: str) -> Dict[str, Any]:
     """LLM check: logical adjacency of connected nodes."""
-    adjacency_map = generate_adjacency_map(nodes)
-    nodes_json = json.dumps(nodes, indent=2)
+    nodes_compact = compact_nodes_repr(nodes)
 
     llm = get_model("context")
     structured_llm = llm.with_structured_output(ContextFeedback)
@@ -430,8 +406,7 @@ def check_context(nodes: dict, source_text: str) -> Dict[str, Any]:
         HumanMessage(
             content=_CONTEXT_HUMAN.format(
                 source_text=source_text,
-                adjacency_map=adjacency_map,
-                nodes_json=nodes_json,
+                nodes_compact=nodes_compact,
             )
         ),
     ]
@@ -439,24 +414,6 @@ def check_context(nodes: dict, source_text: str) -> Dict[str, Any]:
     result = safe_invoke(structured_llm, messages, context="context_check")
     return {"is_valid": result.is_valid, "issues": result.issues}
 
-
-def check_granularity(nodes: dict, source_text: str) -> GranularityFeedback:
-    """LLM check: are graph nodes granular enough vs the source SOP?"""
-    nodes_json = json.dumps(nodes, indent=2)
-
-    llm = get_model("completeness")  # same temp=0.0 as other analyser checks
-    structured_llm = llm.with_structured_output(GranularityFeedback)
-    messages = [
-        SystemMessage(content=_GRANULARITY_SYSTEM),
-        HumanMessage(
-            content=_GRANULARITY_HUMAN.format(
-                source_text=source_text,
-                nodes_json=nodes_json,
-            )
-        ),
-    ]
-
-    return safe_invoke(structured_llm, messages, context="granularity_check")
 
 
 # ===========================================================================
@@ -478,7 +435,7 @@ def analyse(state: GraphState) -> GraphState:
     report_parts = []
 
     # 1. Topological check (code-based, free)
-    logger.info("  [ANALYSER] Check 1/4: Topological (pure Python)...")
+    logger.info("  [ANALYSER] Check 1/3: Topological (pure Python)...")
     topo_report = get_graph_issues(nodes)
     report_parts.append(f"## Topological Check\n{topo_report}")
     has_topo_issues = topo_report != "Topology Valid."
@@ -488,7 +445,7 @@ def analyse(state: GraphState) -> GraphState:
         logger.info("    Topology: VALID")
 
     # 2. Completeness check (LLM-based)
-    logger.info("  [ANALYSER] Check 2/4: Completeness (LLM)...")
+    logger.info("  [ANALYSER] Check 2/3: Completeness (LLM)...")
     completeness = check_completeness(nodes, source_text)
     report_parts.append(
         f"## Completeness Check\n"
@@ -500,7 +457,7 @@ def analyse(state: GraphState) -> GraphState:
         logger.info("    Missing branches: %s", completeness.missing_branches)
 
     # 3. Context check (LLM-based)
-    logger.info("  [ANALYSER] Check 3/4: Context adjacency (LLM)...")
+    logger.info("  [ANALYSER] Check 3/3: Context adjacency (LLM)...")
     context_result = check_context(nodes, source_text)
     report_parts.append(
         f"## Context Check\n"
@@ -511,25 +468,11 @@ def analyse(state: GraphState) -> GraphState:
     if context_result["issues"]:
         logger.info("    Context issues: %s", context_result["issues"])
 
-    # 4. Granularity check (LLM-based)
-    logger.info("  [ANALYSER] Check 4/4: Granularity (LLM)...")
-    granularity = check_granularity(nodes, source_text)
-    report_parts.append(
-        f"## Granularity Check\n"
-        f"Granular: {granularity.is_granular}\n"
-        f"Coarse nodes: {[c.node_id for c in granularity.coarse_nodes]}"
-    )
-    logger.info("    Granular: %s", granularity.is_granular)
-    if granularity.coarse_nodes:
-        for c in granularity.coarse_nodes:
-            logger.info("    COARSE: %s (split→%d): %s", c.node_id, c.suggested_split, c.reason)
-
     # Aggregate: graph is complete only if ALL checks pass
     is_complete = (
         not has_topo_issues
         and completeness.is_complete
         and context_result["is_valid"]
-        and granularity.is_granular
     )
 
     # Build categorized feedback for the refiner (one patch per category)
@@ -547,14 +490,6 @@ def analyse(state: GraphState) -> GraphState:
         categorized_feedback["context"] = (
             f"Fix these logical adjacency issues between connected nodes: "
             f"{context_result['issues']}"
-        )
-    if not granularity.is_granular:
-        coarse_desc = "; ".join(
-            f"'{c.node_id}' ({c.reason}, split into ~{c.suggested_split} steps)"
-            for c in granularity.coarse_nodes
-        )
-        categorized_feedback["granularity"] = (
-            f"Expand these coarse nodes into detailed sub-steps: {coarse_desc}"
         )
 
     # Also store the flat string for backward compat / logging
@@ -767,7 +702,6 @@ class GraphPatchResolver:
             empty_patch = GraphPatch(reasoning="No issues to fix.")
             return nodes, empty_patch
 
-        adjacency_map = generate_adjacency_map(nodes)
         nodes_json = json.dumps(nodes, indent=2)
 
         structured_llm = self.llm.with_structured_output(GraphPatch)
@@ -776,7 +710,6 @@ class GraphPatchResolver:
             HumanMessage(
                 content=_PATCH_RESOLVER_HUMAN.format(
                     source_text=source_text,
-                    adjacency_map=adjacency_map,
                     nodes_json=nodes_json,
                     feedback=feedback,
                 )
@@ -946,7 +879,7 @@ def refine(state: GraphState) -> GraphState:
         )
 
     # 2. Per-category graph patching
-    category_order = ["topological", "completeness", "context", "granularity", "triplets"]
+    category_order = ["topological", "completeness", "context", "triplets"]
     applied_categories = []
 
     for category in category_order:
