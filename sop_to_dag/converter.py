@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from sop_to_dag.graph_ops import apply_patch, generate_adjacency_map, get_graph_issues
-from sop_to_dag.models import get_model, safe_invoke
+from sop_to_dag.models import LLMStopError, get_model, safe_invoke
 from sop_to_dag.graph_ops import SchemaValidator
 from sop_to_dag.schemas import GraphPatch, InitialGraph, WorkflowNode
 
@@ -97,23 +97,54 @@ Capture every detail — do not summarize or skip steps.
 """
 
 _PATCH_SYSTEM = """\
-You are a Graph Refinement Engineer. You compare a specific SOP section/chunk \
-against an existing workflow graph to find MISSING or INCORRECT details.
+You are a Graph Refinement Engineer performing a LINE-BY-LINE audit of an SOP \
+section against an existing workflow graph. Your goal is to catch EVERY missing \
+detail, no matter how small.
 
 You receive:
 - The current graph as an adjacency map (showing connections)
 - The current graph as full JSON (showing all node details)
-- One specific SOP section/chunk to verify against the graph
+- One specific SOP section/chunk to audit against the graph
 
-Your job:
-1. Read the SOP section carefully
-2. Check if every action, decision, reference, and detail from that section \
-is captured in the graph
-3. If anything is MISSING — add it via add_nodes
-4. If any existing node is INCORRECT or needs updating — fix it via modify_nodes
-5. If any node should be removed — list it in remove_nodes
-6. Do NOT remove or restructure nodes that are correct
-7. Do NOT add nodes for content not in this SOP section
+AUDIT PROCESS (follow this exactly in your reasoning):
+
+Step 1 — EXTRACT: Read the SOP chunk sentence by sentence. For each sentence, \
+list every discrete detail:
+  - Specific actions (clicks, data entry, navigation steps, lookups)
+  - Decision points and their conditions (thresholds, codes, statuses)
+  - System/tool names where actions are performed
+  - Role assignments (who does what)
+  - Specific field names, values, codes, or thresholds mentioned
+  - References to other documents, SOPs, or procedures
+  - Temporal dependencies ("after X", "before Y", "within N days")
+  - Exception/error handling paths
+
+Step 2 — MATCH: For each extracted detail, find the graph node(s) that capture \
+it. Mark each detail as:
+  ✓ COVERED — a node captures this detail accurately
+  ~ PARTIAL — a node mentions it but is missing specifics (wrong system name, \
+missing threshold value, vague text that loses the original detail)
+  ✗ MISSING — no node captures this detail
+
+Step 3 — PATCH: For every MISSING or PARTIAL detail, produce the appropriate \
+add/modify operations. Be specific:
+  - MISSING action → add a new instruction node, wire it into the correct \
+position in the flow
+  - MISSING decision → add a question node with correct options
+  - PARTIAL node → modify it to include the missing specifics (system name, \
+field name, threshold, role)
+  - MISSING reference → add a reference node with external_ref
+  - MISSING role/system metadata → modify existing node to add role/system fields
+
+WHAT TO LOOK FOR (common gaps Step 1 misses):
+- Sub-steps within a bullet point ("Open System X, navigate to Tab Y, click Z" \
+= 3 separate nodes, not 1)
+- Conditional paths that the graph collapsed into a single branch
+- Specific system names or tool names that the graph replaced with generic text
+- Exact field names, codes, or threshold values that the graph omitted
+- Role assignments ("the analyst does X, the supervisor does Y")
+- Time constraints ("within 2 business days", "before end of shift")
+- Error/exception paths ("if the system is unavailable, do X instead")
 
 PATCH RULES:
 - When ADDING nodes: ensure their "next"/"options" point to existing node IDs \
@@ -128,9 +159,10 @@ and modify node A to have next=N.
 - For INSERTING a decision that splits a chain A→B: add the question node Q \
 and any new branch nodes, modify A to point to Q, and ensure branch ends \
 point to B (or wherever they should converge).
+- Do NOT remove or restructure nodes that are correct.
+- Do NOT add nodes for content not in this SOP section.
 
-If the graph already captures this chunk completely, return empty lists \
-for add_nodes, modify_nodes, and remove_nodes.
+If (and ONLY if) every detail is ✓ COVERED, return empty lists.
 
 Node schema reminder:
 - instruction: must have "next", "options" must be null
@@ -146,11 +178,11 @@ _PATCH_HUMAN = """\
 ## Current Graph (Full Nodes JSON)
 {nodes_json}
 
-## SOP Chunk to Verify
+## SOP Chunk to Audit
 {chunk_text}
 
-Return a GraphPatch with any additions, modifications, or removals needed. \
-If the graph already captures this chunk completely, return empty lists.
+Follow the 3-step audit process (Extract → Match → Patch) in your reasoning. \
+List every detail you extract and its coverage status before producing the patch.
 """
 
 
@@ -194,22 +226,32 @@ def _to_snake_case(text: str) -> str:
     return slug or "node"
 
 
-def _reassemble_enriched_sop(
+def _reassemble_sop(
     source_text: str,
     enriched_chunks: Optional[List[dict]],
+    include_context: bool = False,
 ) -> str:
-    """Reassemble enriched chunks into one document with cross-references inlined."""
+    """Reassemble chunks into one document.
+
+    Args:
+        source_text: Raw SOP text (fallback if no enriched chunks).
+        enriched_chunks: Entity-resolved chunks with optional cross-ref context.
+        include_context: If True, append cross-reference context notes.
+            Step 1 sets this to False (LLM sees the full doc, notes are noise).
+            Step 2 would set True, but Step 2 sends chunks individually instead.
+    """
     if not enriched_chunks:
         return source_text
 
     parts = []
     for ec in enriched_chunks:
         chunk_text = ec.get("chunk_text", "")
-        retrieved = ec.get("retrieved_context", "")
-
         parts.append(chunk_text)
-        if retrieved.strip():
-            parts.append(f"[Cross-reference context: {retrieved.strip()}]")
+
+        if include_context:
+            retrieved = ec.get("retrieved_context", "")
+            if retrieved.strip():
+                parts.append(f"[Cross-reference context: {retrieved.strip()}]")
 
     return "\n\n".join(parts)
 
@@ -278,7 +320,9 @@ class PipelineConverter:
             logger.info("[CONVERTER] Stage outputs dir: %s (resume=%s)", dump_path, resume)
 
         # Reassemble enriched chunks into one document
-        enriched_sop = _reassemble_enriched_sop(source_text, enriched_chunks)
+        # Step 1 gets entity-resolved text WITHOUT cross-ref context notes.
+        # The LLM sees the full doc — cross-ref notes are redundant noise.
+        enriched_sop = _reassemble_sop(source_text, enriched_chunks, include_context=False)
         logger.info("[CONVERTER] Enriched SOP: %d chars", len(enriched_sop))
 
         if dump_path:
@@ -439,6 +483,11 @@ class PipelineConverter:
 
                         pass_changes += changes
 
+                    except LLMStopError:
+                        # Non-200 API response (rate limit, server error) — stop
+                        # the pipeline. Checkpoint was saved for the previous chunk,
+                        # so --resume will pick up from here.
+                        raise
                     except Exception as e:
                         logger.warning(
                             "    Patch failed for chunk %d (%s) — keeping previous graph.",
