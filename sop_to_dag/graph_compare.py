@@ -393,16 +393,220 @@ def _get_edges(nodes: Dict[str, Dict]) -> Set[Tuple[str, str]]:
     return edges
 
 
+EDGE_LLM_BATCH_SIZE = 12
+
+_EDGE_MATCH_SYSTEM = """\
+You are a Workflow Graph Edge Analyst. You compare connections (edges) between \
+two workflow graphs that represent the same SOP process.
+
+You receive a batch of human graph edges that were NOT matched by structural \
+analysis. For each edge, you also see the surrounding subgraph context from \
+both the human graph and the auto graph.
+
+Your job: decide whether the auto graph **semantically preserves** each human \
+edge's flow, even if the structure differs.
+
+An edge is PRESERVED if:
+1. The auto graph has a path (possibly through intermediate steps) that \
+   connects equivalent steps in the same logical order.
+2. The branching logic is consistent — if the human edge is a "Yes" branch \
+   from a decision, the auto graph should also take the affirmative path.
+3. The flow intent is the same even if intermediate steps are added or removed.
+
+An edge is NOT PRESERVED if:
+1. The auto graph has no path connecting the equivalent steps.
+2. The flow goes through a DIFFERENT decision branch (e.g., human takes "Yes" \
+   but auto takes "No" path to reach the target).
+3. One or both endpoints have no equivalent auto node at all.
+
+Return a JSON list:
+[{{"human_edge": "src → tgt", "preserved": true/false, "reason": "..."}}]
+"""
+
+_EDGE_MATCH_HUMAN = """\
+## Unmatched Human Edges
+
+{edges_text}
+
+## Auto Graph Context (relevant subgraph)
+{auto_context}
+
+For each human edge, determine if the auto graph semantically preserves this \
+connection. Return preserved (true/false) and a one-sentence reason.
+"""
+
+
+def _get_node_neighborhood(
+    nodes: Dict[str, Dict], node_id: str, hops: int = 2,
+) -> Dict[str, Dict]:
+    """Get a node and its neighborhood (predecessors + successors) within N hops."""
+    neighborhood: Dict[str, Dict] = {}
+    if node_id not in nodes:
+        return neighborhood
+
+    # Forward traversal
+    frontier = [node_id]
+    visited = {node_id}
+    for _ in range(hops):
+        next_frontier = []
+        for nid in frontier:
+            data = nodes.get(nid, {})
+            neighborhood[nid] = data
+            successors = []
+            if data.get("next"):
+                successors.append(data["next"])
+            if data.get("options"):
+                successors.extend(data["options"].values())
+            for s in successors:
+                if s not in visited and s in nodes:
+                    visited.add(s)
+                    next_frontier.append(s)
+        frontier = next_frontier
+
+    # Backward traversal (find predecessors)
+    predecessors: Dict[str, List[str]] = {}
+    for nid, data in nodes.items():
+        if data.get("next"):
+            predecessors.setdefault(data["next"], []).append(nid)
+        if data.get("options"):
+            for tgt in data["options"].values():
+                predecessors.setdefault(tgt, []).append(nid)
+
+    frontier = [node_id]
+    visited_back = {node_id}
+    for _ in range(hops):
+        next_frontier = []
+        for nid in frontier:
+            for pred in predecessors.get(nid, []):
+                if pred not in visited_back:
+                    visited_back.add(pred)
+                    neighborhood[pred] = nodes.get(pred, {})
+                    next_frontier.append(pred)
+        frontier = next_frontier
+
+    return neighborhood
+
+
+def _format_subgraph(nodes: Dict[str, Dict]) -> str:
+    """Format a subgraph for LLM context."""
+    parts = []
+    for nid, data in sorted(nodes.items()):
+        line = f"  `{nid}` ({data.get('type', '?')}): \"{data.get('text', '')[:80]}\""
+        if data.get("next"):
+            line += f" → `{data['next']}`"
+        if data.get("options"):
+            opts = ", ".join(f"{k}: `{v}`" for k, v in data["options"].items())
+            line += f" → {{{opts}}}"
+        parts.append(line)
+    return "\n".join(parts)
+
+
+def _llm_validate_edges(
+    llm,
+    unmatched_edges: List[Dict],
+    auto_nodes: Dict[str, Dict],
+    human_nodes: Dict[str, Dict],
+    human_to_auto_set: Dict[str, Set[str]],
+) -> Dict[str, bool]:
+    """LLM validation for edges that failed deterministic matching.
+
+    Returns {edge_key: preserved} for each validated edge.
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    results: Dict[str, Dict[str, Any]] = {}
+
+    for batch_start in range(0, len(unmatched_edges), EDGE_LLM_BATCH_SIZE):
+        batch = unmatched_edges[batch_start:batch_start + EDGE_LLM_BATCH_SIZE]
+        batch_num = batch_start // EDGE_LLM_BATCH_SIZE + 1
+
+        # Build edge descriptions + collect relevant auto subgraph
+        edge_parts = []
+        auto_neighborhood: Dict[str, Dict] = {}
+        for edge_info in batch:
+            h_src = edge_info["_h_src"]
+            h_tgt = edge_info["_h_tgt"]
+            h_src_text = human_nodes.get(h_src, {}).get("text", "?")[:80]
+            h_tgt_text = human_nodes.get(h_tgt, {}).get("text", "?")[:80]
+
+            # Show human edge with context
+            part = f"- **`{h_src}` → `{h_tgt}`**\n"
+            part += f"  Source: \"{h_src_text}\"\n"
+            part += f"  Target: \"{h_tgt_text}\"\n"
+
+            # Show which auto nodes are aligned to src/tgt
+            a_srcs = human_to_auto_set.get(h_src, set())
+            a_tgts = human_to_auto_set.get(h_tgt, set())
+            if a_srcs:
+                part += f"  Aligned auto sources: {', '.join(f'`{a}`' for a in a_srcs)}\n"
+            else:
+                part += "  Aligned auto sources: (none — source has no auto match)\n"
+            if a_tgts:
+                part += f"  Aligned auto targets: {', '.join(f'`{a}`' for a in a_tgts)}\n"
+            else:
+                part += "  Aligned auto targets: (none — target has no auto match)\n"
+
+            edge_parts.append(part)
+
+            # Collect neighborhoods of aligned auto nodes for context
+            for a_id in a_srcs | a_tgts:
+                auto_neighborhood.update(_get_node_neighborhood(auto_nodes, a_id, hops=2))
+
+        edges_text = "\n".join(edge_parts)
+        auto_context = _format_subgraph(auto_neighborhood) if auto_neighborhood else "(no aligned auto nodes)"
+
+        messages = [
+            SystemMessage(content=_EDGE_MATCH_SYSTEM),
+            HumanMessage(content=_EDGE_MATCH_HUMAN.format(
+                edges_text=edges_text, auto_context=auto_context,
+            )),
+        ]
+
+        try:
+            response = llm.invoke(messages)
+            content = response.content.strip()
+            if "```" in content:
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+                content = content.strip()
+            verdicts = json.loads(content)
+
+            for v in verdicts:
+                edge_key = v.get("human_edge", "")
+                results[edge_key] = {
+                    "preserved": bool(v.get("preserved", False)),
+                    "reason": v.get("reason", ""),
+                }
+            logger.info("  Edge batch %d: %d/%d preserved by LLM",
+                       batch_num,
+                       sum(1 for v in verdicts if v.get("preserved")),
+                       len(batch))
+        except Exception as e:
+            logger.warning("Edge LLM validation failed for batch %d: %s", batch_num, e)
+            for edge_info in batch:
+                edge_key = edge_info["human_edge"]
+                if edge_key not in results:
+                    results[edge_key] = {
+                        "preserved": False,
+                        "reason": f"LLM validation failed: {e}",
+                    }
+
+    return results
+
+
 def _compare_edges(
     auto_nodes: Dict[str, Dict],
     human_nodes: Dict[str, Dict],
     alignment: AlignmentResult,
 ) -> EdgeComparisonResult:
-    """Compare edge structure between aligned graphs.
+    """Hybrid edge comparison: deterministic path-check + LLM validation.
 
-    An auto edge (a1→a2) matches a human edge (h1→h2) if:
-    - a1 is aligned to h1 (or h1 is aligned to a1)
-    - a2 is aligned to h2 (or h2 is aligned to a2)
+    Phase 1 (deterministic): Check if a path exists in auto graph between
+    aligned nodes (up to 3 hops). Free, catches obvious matches.
+
+    Phase 2 (LLM): For edges that fail Phase 1, send to LLM with subgraph
+    context. LLM checks semantic flow preservation, branching logic, etc.
     """
     auto_edges = _get_edges(auto_nodes)
     human_edges = _get_edges(human_nodes)
@@ -418,23 +622,20 @@ def _compare_edges(
         for a_id, _ in matches:
             human_to_auto_set.setdefault(h_id, set()).add(a_id)
 
-    # Check which human edges are covered by auto edges
-    matched = 0
-    mismatches = []
+    # Phase 1: Deterministic path check
+    det_matched = 0
+    det_mismatches = []
 
     for h_src, h_tgt in human_edges:
-        # Find all auto nodes aligned to h_src and h_tgt
         a_srcs = human_to_auto_set.get(h_src, set())
         a_tgts = human_to_auto_set.get(h_tgt, set())
 
-        # Check if any auto edge connects an aligned src to an aligned tgt
         found = False
         for a_src in a_srcs:
             for a_tgt in a_tgts:
                 if (a_src, a_tgt) in auto_edges:
                     found = True
                     break
-                # Also check indirect paths: a_src → ... → a_tgt within 3 hops
                 if _has_path(auto_nodes, a_src, a_tgt, max_hops=3):
                     found = True
                     break
@@ -442,15 +643,68 @@ def _compare_edges(
                 break
 
         if found:
-            matched += 1
+            det_matched += 1
         else:
-            mismatches.append({
+            det_mismatches.append({
                 "human_edge": f"{h_src} → {h_tgt}",
-                "human_src_text": human_nodes.get(h_src, {}).get("text", "?")[:60],
-                "human_tgt_text": human_nodes.get(h_tgt, {}).get("text", "?")[:60],
+                "human_src_text": human_nodes.get(h_src, {}).get("text", "?")[:80],
+                "human_tgt_text": human_nodes.get(h_tgt, {}).get("text", "?")[:80],
                 "auto_candidates_src": list(a_srcs)[:3],
                 "auto_candidates_tgt": list(a_tgts)[:3],
+                "_h_src": h_src,
+                "_h_tgt": h_tgt,
             })
+
+    logger.info("  Phase 1 (deterministic): %d/%d human edges matched, %d unmatched",
+                det_matched, len(human_edges), len(det_mismatches))
+
+    # Phase 2: LLM validation — only for DECISION edges (question/decision nodes)
+    # Sequential instruction→instruction edges are trivial; decision branches are
+    # where the real logic lives and where structural differences matter.
+    decision_types = {"question", "decision"}
+    decision_mismatches = [
+        e for e in det_mismatches
+        if human_nodes.get(e["_h_src"], {}).get("type") in decision_types
+    ]
+    non_decision_mismatches = [
+        e for e in det_mismatches
+        if human_nodes.get(e["_h_src"], {}).get("type") not in decision_types
+    ]
+
+    logger.info("  Phase 2: %d decision edges to validate by LLM (%d non-decision skipped)",
+                len(decision_mismatches), len(non_decision_mismatches))
+
+    llm_recovered = 0
+    final_mismatches = []
+
+    # Non-decision edges go straight to mismatches (no LLM needed)
+    for edge_info in non_decision_mismatches:
+        clean = {k: v for k, v in edge_info.items() if not k.startswith("_")}
+        clean["llm_reason"] = "Skipped — non-decision edge"
+        final_mismatches.append(clean)
+
+    if decision_mismatches:
+        llm = _get_llm()
+        llm_results = _llm_validate_edges(
+            llm, decision_mismatches, auto_nodes, human_nodes, human_to_auto_set,
+        )
+
+        for edge_info in decision_mismatches:
+            edge_key = edge_info["human_edge"]
+            llm_verdict = llm_results.get(edge_key, {})
+
+            if llm_verdict.get("preserved", False):
+                llm_recovered += 1
+            else:
+                clean = {k: v for k, v in edge_info.items() if not k.startswith("_")}
+                clean["llm_reason"] = llm_verdict.get("reason", "Not evaluated")
+                final_mismatches.append(clean)
+
+        logger.info("  Phase 2 (LLM): recovered %d/%d decision edges, %d truly unmatched",
+                    llm_recovered, len(decision_mismatches),
+                    len(final_mismatches) - len(non_decision_mismatches))
+
+    total_matched = det_matched + llm_recovered
 
     # Type comparison for grounded auto nodes
     type_matches = 0
@@ -463,10 +717,10 @@ def _compare_edges(
             type_matches += 1
 
     return EdgeComparisonResult(
-        matched_edges=matched,
+        matched_edges=total_matched,
         total_auto_edges=len(auto_edges),
         total_human_edges=len(human_edges),
-        mismatches=mismatches,
+        mismatches=final_mismatches,
         type_matches=type_matches,
         type_total=type_total,
     )
@@ -1274,17 +1528,38 @@ def generate_markdown_report(report: Dict[str, Any]) -> str:
     # --- Edge Mismatches ---
     edge_mm = report.get("edge_mismatches", [])
     if edge_mm:
+        # Split into decision vs non-decision edges
+        decision_mm = [e for e in edge_mm if e.get("llm_reason", "") != "Skipped — non-decision edge"]
+        non_decision_mm = [e for e in edge_mm if e.get("llm_reason", "") == "Skipped — non-decision edge"]
+
         _add(f"## {section_num}. Edge Mismatches ({len(edge_mm)} unmatched human edges)")
         _add()
-        _add("These edges exist in the human graph but have no corresponding path in the auto graph:")
-        _add()
-        _add("| Human Edge | Source Text | Target Text |")
-        _add("|---|---|---|")
-        for e in edge_mm[:30]:
-            _add(f"| `{e['human_edge']}` | {e['human_src_text']} | {e['human_tgt_text']} |")
-        if len(edge_mm) > 30:
-            _add(f"| ... | *{len(edge_mm) - 30} more* | |")
-        _add()
+
+        if decision_mm:
+            _add(f"### {section_num}.1 Decision Edge Mismatches ({len(decision_mm)} — LLM validated)")
+            _add()
+            _add("These decision branches in the human graph are NOT preserved in the auto graph:")
+            _add()
+            for e in decision_mm[:30]:
+                _add(f"- **`{e['human_edge']}`**")
+                _add(f"  - Source: {e['human_src_text']}")
+                _add(f"  - Target: {e['human_tgt_text']}")
+                _add(f"  - *Reason*: {e.get('llm_reason', 'N/A')}")
+                _add()
+
+        if non_decision_mm:
+            _add(f"### {section_num}.2 Sequential Edge Mismatches ({len(non_decision_mm)})")
+            _add()
+            _add("These non-decision edges have no corresponding auto path (structural only, not LLM-validated):")
+            _add()
+            _add("| Human Edge | Source Text | Target Text |")
+            _add("|---|---|---|")
+            for e in non_decision_mm[:30]:
+                _add(f"| `{e['human_edge']}` | {e['human_src_text']} | {e['human_tgt_text']} |")
+            if len(non_decision_mm) > 30:
+                _add(f"| ... | *{len(non_decision_mm) - 30} more* | |")
+            _add()
+
         section_num += 1
 
     # --- Similarity Matrix ---
