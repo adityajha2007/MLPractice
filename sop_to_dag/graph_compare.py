@@ -30,8 +30,6 @@ logger = logging.getLogger(__name__)
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-base-en-v1.5"
 LLM_MODEL_NAME = "gpt-oss-120b"
-ALIGNMENT_THRESHOLD = 0.70
-SOP_GROUNDING_THRESHOLD = 0.72
 SOP_CHUNK_SIZE = 500  # characters per SOP chunk for FAISS indexing
 TOP_K_CANDIDATES = 10  # embedding candidates per human node for LLM verification
 LLM_BATCH_SIZE = 10  # human nodes per LLM matching call
@@ -61,6 +59,10 @@ class AlignmentResult:
     grounded_auto: Set[str] = field(default_factory=set)
     unmatched_human: Set[str] = field(default_factory=set)
     unmatched_auto: Set[str] = field(default_factory=set)
+    # Similarity matrix: auto_ids (rows) x human_ids (cols)
+    sim_matrix: Optional[np.ndarray] = field(default=None, repr=False)
+    auto_ids: List[str] = field(default_factory=list)
+    human_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -270,7 +272,6 @@ def _llm_match_batch(
 def _align_nodes(
     auto_nodes: Dict[str, Dict],
     human_nodes: Dict[str, Dict],
-    threshold: float = ALIGNMENT_THRESHOLD,
 ) -> AlignmentResult:
     """Hybrid alignment: embeddings for top-K candidates, LLM for final matching.
 
@@ -326,7 +327,9 @@ def _align_nodes(
 
     # Phase 3: Build AlignmentResult from LLM matches
     logger.info("Phase 3: Building alignment from LLM results...")
-    result = AlignmentResult()
+    result = AlignmentResult(
+        sim_matrix=sim_matrix, auto_ids=auto_ids, human_ids=human_ids,
+    )
 
     # Get embedding similarity for matched pairs (for reporting)
     auto_idx = {a_id: i for i, a_id in enumerate(auto_ids)}
@@ -524,52 +527,160 @@ def _chunk_sop(sop_text: str, chunk_size: int = SOP_CHUNK_SIZE) -> List[str]:
     return chunks
 
 
+_GROUNDING_SYSTEM = """\
+You are an SOP Verification Specialist. You determine whether workflow graph \
+nodes are grounded in (i.e., explicitly stated or directly implied by) the \
+original SOP document.
+
+You receive a batch of graph nodes and the most relevant SOP excerpts for each.
+
+For EACH node, decide:
+- "grounded": The SOP explicitly describes this step, action, or decision.
+- "not_grounded": The SOP does NOT mention this. It may be inferred, \
+  hallucinated, or added from domain knowledge — but it's not in the document.
+
+RULES:
+1. Be strict. "Grounded" means the SOP TEXT says it, not that it makes sense.
+2. A node is grounded even if the wording differs, as long as the SOP \
+   describes the same action/decision.
+3. A node is NOT grounded if it's a reasonable step that the SOP simply \
+   doesn't mention.
+4. Provide a brief reason for each verdict (1 sentence).
+
+Return a JSON list:
+[{{"id": "node_id", "grounded": true/false, "reason": "..."}}]
+"""
+
+_GROUNDING_HUMAN = """\
+## Graph Nodes to Verify
+
+{nodes_text}
+
+## Source SOP Document
+{sop_text}
+
+For each node, return grounded (true/false) and a one-sentence reason.
+"""
+
+SOP_GROUNDING_BATCH_SIZE = 15
+
+
 def _check_sop_grounding(
     unmatched_nodes: Dict[str, Dict[str, Any]],
     sop_text: str,
-    threshold: float = SOP_GROUNDING_THRESHOLD,
 ) -> Dict[str, Dict[str, Any]]:
-    """For each unmatched node, check if its content exists in the SOP.
+    """LLM-validated SOP grounding for unmatched nodes.
 
-    Returns {node_id: {text, grounded: bool, best_sop_chunk, similarity}}.
+    Uses embeddings to find relevant SOP excerpts per node, then LLM
+    validates whether each node is actually stated in the SOP.
+
+    Returns {node_id: {text, grounded, reason, relevant_sop_excerpt}}.
     """
     if not unmatched_nodes or not sop_text:
         return {
-            nid: {"text": data["text"], "grounded": False, "best_sop_chunk": "", "similarity": 0.0}
+            nid: {"text": data["text"], "grounded": False, "reason": "No SOP provided",
+                  "relevant_sop_excerpt": ""}
             for nid, data in unmatched_nodes.items()
         }
 
-    model = _get_embeddings_model()
+    # Phase 1: Embedding retrieval — find top-3 relevant SOP chunks per node
+    emb_model = _get_embeddings_model()
     chunks = _chunk_sop(sop_text)
 
     if not chunks:
         return {
-            nid: {"text": data["text"], "grounded": False, "best_sop_chunk": "", "similarity": 0.0}
+            nid: {"text": data["text"], "grounded": False, "reason": "SOP empty",
+                  "relevant_sop_excerpt": ""}
             for nid, data in unmatched_nodes.items()
         }
 
-    logger.info("SOP grounding: %d unmatched nodes against %d SOP chunks", len(unmatched_nodes), len(chunks))
+    logger.info("SOP grounding: %d nodes, retrieving relevant SOP chunks...",
+                len(unmatched_nodes))
 
-    chunk_emb = _embed_texts(model, chunks)
+    chunk_emb = _embed_texts(emb_model, chunks)
     node_ids = list(unmatched_nodes.keys())
     node_texts = [unmatched_nodes[nid]["text"] for nid in node_ids]
-    node_emb = _embed_texts(model, node_texts)
-
+    node_emb = _embed_texts(emb_model, node_texts)
     sim_matrix = _cosine_similarity_matrix(node_emb, chunk_emb)
 
-    results = {}
+    # Top-3 SOP chunks per node
+    node_excerpts: Dict[str, str] = {}
     for i, nid in enumerate(node_ids):
-        best_j = int(np.argmax(sim_matrix[i]))
-        best_sim = float(sim_matrix[i][best_j])
-        results[nid] = {
-            "text": unmatched_nodes[nid]["text"],
-            "grounded": best_sim >= threshold,
-            "best_sop_chunk": chunks[best_j][:200],
-            "similarity": round(best_sim, 4),
-        }
+        top_indices = np.argsort(sim_matrix[i])[-3:][::-1]
+        top_chunks = [chunks[j] for j in top_indices]
+        node_excerpts[nid] = "\n---\n".join(top_chunks)
+
+    # Phase 2: LLM validation in batches
+    logger.info("SOP grounding: LLM validation in batches of %d...",
+                SOP_GROUNDING_BATCH_SIZE)
+    llm = _get_llm()
+    results: Dict[str, Dict[str, Any]] = {}
+
+    for batch_start in range(0, len(node_ids), SOP_GROUNDING_BATCH_SIZE):
+        batch_ids = node_ids[batch_start:batch_start + SOP_GROUNDING_BATCH_SIZE]
+        batch_num = batch_start // SOP_GROUNDING_BATCH_SIZE + 1
+
+        nodes_text_parts = []
+        for nid in batch_ids:
+            nodes_text_parts.append(
+                f"- `{nid}`: \"{unmatched_nodes[nid]['text']}\""
+            )
+        nodes_text = "\n".join(nodes_text_parts)
+
+        from langchain_core.messages import HumanMessage, SystemMessage
+        messages = [
+            SystemMessage(content=_GROUNDING_SYSTEM),
+            HumanMessage(content=_GROUNDING_HUMAN.format(
+                nodes_text=nodes_text, sop_text=sop_text,
+            )),
+        ]
+
+        try:
+            response = llm.invoke(messages)
+            content = response.content.strip()
+            if "```" in content:
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+                content = content.strip()
+            verdicts = json.loads(content)
+
+            for v in verdicts:
+                nid = v.get("id", "")
+                if nid in unmatched_nodes:
+                    results[nid] = {
+                        "text": unmatched_nodes[nid]["text"],
+                        "grounded": bool(v.get("grounded", False)),
+                        "reason": v.get("reason", ""),
+                        "relevant_sop_excerpt": node_excerpts.get(nid, "")[:300],
+                    }
+            logger.info("  Batch %d: %d/%d nodes grounded",
+                       batch_num,
+                       sum(1 for nid in batch_ids if results.get(nid, {}).get("grounded")),
+                       len(batch_ids))
+        except Exception as e:
+            logger.warning("SOP grounding LLM failed for batch %d: %s — marking as unknown", batch_num, e)
+            for nid in batch_ids:
+                if nid not in results:
+                    results[nid] = {
+                        "text": unmatched_nodes[nid]["text"],
+                        "grounded": False,
+                        "reason": f"LLM validation failed: {e}",
+                        "relevant_sop_excerpt": node_excerpts.get(nid, "")[:300],
+                    }
+
+    # Fill any missing
+    for nid in node_ids:
+        if nid not in results:
+            results[nid] = {
+                "text": unmatched_nodes[nid]["text"],
+                "grounded": False,
+                "reason": "Not evaluated",
+                "relevant_sop_excerpt": "",
+            }
 
     grounded_count = sum(1 for r in results.values() if r["grounded"])
-    logger.info("SOP grounding: %d/%d nodes grounded", grounded_count, len(results))
+    logger.info("SOP grounding complete: %d/%d nodes grounded by LLM", grounded_count, len(results))
 
     return results
 
@@ -759,7 +870,6 @@ def generate_report(
     sop_text: Optional[str] = None,
     auto_format: str = "auto",
     human_format: str = "human",
-    threshold: float = ALIGNMENT_THRESHOLD,
 ) -> Dict[str, Any]:
     """Full three-way comparison: auto graph vs human graph vs SOP.
 
@@ -769,7 +879,6 @@ def generate_report(
         sop_text: Original SOP document text (optional, enables grounding check).
         auto_format: "auto" (our WorkflowNode format) or "human" (if same format).
         human_format: "human" (their format) or "auto" (if same format).
-        threshold: Cosine similarity threshold for alignment.
 
     Returns:
         Full comparison report dict.
@@ -792,7 +901,7 @@ def generate_report(
 
     # Step 1: Semantic alignment
     logger.info("Step 1: Semantic node alignment...")
-    alignment = _align_nodes(auto_nodes, human_nodes, threshold=threshold)
+    alignment = _align_nodes(auto_nodes, human_nodes)
 
     # Step 2: Edge comparison
     logger.info("Step 2: Structural edge comparison...")
@@ -858,16 +967,17 @@ def generate_report(
     for nid in alignment.unmatched_auto:
         entry = {
             "id": nid,
-            "text": auto_nodes[nid]["text"][:150],
+            "text": auto_nodes[nid]["text"],
             "type": auto_nodes[nid]["type"],
         }
         if auto_grounding and nid in auto_grounding:
             g = auto_grounding[nid]
             entry["verdict"] = "auto_advantage" if g["grounded"] else "hallucinated"
-            entry["sop_similarity"] = g["similarity"]
-            entry["best_sop_chunk"] = g["best_sop_chunk"][:100]
+            entry["reason"] = g.get("reason", "")
+            entry["relevant_sop_excerpt"] = g.get("relevant_sop_excerpt", "")[:200]
         else:
             entry["verdict"] = "unknown"
+            entry["reason"] = "SOP not provided for grounding check"
         auto_only.append(entry)
 
     # Build human-only detail
@@ -875,21 +985,35 @@ def generate_report(
     for nid in alignment.unmatched_human:
         entry = {
             "id": nid,
-            "text": human_nodes[nid]["text"][:150],
+            "text": human_nodes[nid]["text"],
             "type": human_nodes[nid]["type"],
         }
         if human_grounding and nid in human_grounding:
             g = human_grounding[nid]
             entry["verdict"] = "gap" if g["grounded"] else "human_extrapolation"
-            entry["sop_similarity"] = g["similarity"]
-            entry["best_sop_chunk"] = g["best_sop_chunk"][:100]
+            entry["reason"] = g.get("reason", "")
+            entry["relevant_sop_excerpt"] = g.get("relevant_sop_excerpt", "")[:200]
         else:
             entry["verdict"] = "unknown"
+            entry["reason"] = "SOP not provided for grounding check"
         human_only.append(entry)
 
     # Graph-level metrics
     auto_metrics = _compute_single_graph_metrics(auto_nodes)
     human_metrics = _compute_single_graph_metrics(human_nodes)
+
+    # Build similarity matrix table (auto_id × human_id → cosine sim)
+    sim_matrix_table = None
+    if alignment.sim_matrix is not None:
+        sim_matrix_table = {
+            "auto_ids": alignment.auto_ids,
+            "human_ids": alignment.human_ids,
+            "matrix": [
+                [round(float(alignment.sim_matrix[i][j]), 4)
+                 for j in range(len(alignment.human_ids))]
+                for i in range(len(alignment.auto_ids))
+            ],
+        }
 
     report = {
         "summary": metrics,
@@ -900,6 +1024,7 @@ def generate_report(
         "auto_only": auto_only,
         "human_only": human_only,
         "edge_mismatches": edge_result.mismatches[:50],
+        "similarity_matrix": sim_matrix_table,
     }
 
     logger.info("=== Comparison complete ===")
@@ -1069,22 +1194,20 @@ def generate_markdown_report(report: Dict[str, Any]) -> str:
             _add()
             _add("Our auto graph caught these SOP details that the human graph missed:")
             _add()
-            _add("| Auto ID | Text | SOP Similarity |")
-            _add("|---|---|---|")
             for n in auto_advantages:
-                _add(f"| `{n['id']}` | {n['text'][:80]} | {n.get('sop_similarity', 0):.2f} |")
-            _add()
+                _add(f"- **`{n['id']}`**: {n['text']}")
+                _add(f"  - *Evidence*: {n.get('reason', 'N/A')}")
+                _add()
 
         if auto_hallucinated:
             _add(f"### {section_num}.2 Potential Hallucinations ({len(auto_hallucinated)} nodes)")
             _add()
-            _add("These auto nodes don't appear to be grounded in the SOP:")
+            _add("These auto nodes are NOT grounded in the SOP (LLM-verified):")
             _add()
-            _add("| Auto ID | Text | SOP Similarity |")
-            _add("|---|---|---|")
             for n in auto_hallucinated:
-                _add(f"| `{n['id']}` | {n['text'][:80]} | {n.get('sop_similarity', 0):.2f} |")
-            _add()
+                _add(f"- **`{n['id']}`**: {n['text']}")
+                _add(f"  - *Reason*: {n.get('reason', 'N/A')}")
+                _add()
 
         # True gaps
         true_gaps = [n for n in human_only if n.get("verdict") == "gap"]
@@ -1093,24 +1216,22 @@ def generate_markdown_report(report: Dict[str, Any]) -> str:
         if true_gaps:
             _add(f"### {section_num}.3 True Gaps ({len(true_gaps)} nodes)")
             _add()
-            _add("Our auto graph is missing these steps that ARE in the SOP:")
+            _add("Our auto graph is missing these steps that ARE in the SOP (LLM-verified):")
             _add()
-            _add("| Human ID | Text | SOP Similarity |")
-            _add("|---|---|---|")
             for n in true_gaps:
-                _add(f"| `{n['id']}` | {n['text'][:80]} | {n.get('sop_similarity', 0):.2f} |")
-            _add()
+                _add(f"- **`{n['id']}`**: {n['text']}")
+                _add(f"  - *Evidence*: {n.get('reason', 'N/A')}")
+                _add()
 
         if human_extrap:
             _add(f"### {section_num}.4 Human Extrapolations ({len(human_extrap)} nodes)")
             _add()
-            _add("The human graph added these steps that are NOT in the SOP (domain knowledge or interpretation):")
+            _add("The human graph added these steps that are NOT in the SOP (LLM-verified):")
             _add()
-            _add("| Human ID | Text | SOP Similarity |")
-            _add("|---|---|---|")
             for n in human_extrap:
-                _add(f"| `{n['id']}` | {n['text'][:80]} | {n.get('sop_similarity', 0):.2f} |")
-            _add()
+                _add(f"- **`{n['id']}`**: {n['text']}")
+                _add(f"  - *Reason*: {n.get('reason', 'N/A')}")
+                _add()
 
         # Summary counts
         _add(f"### {section_num}.5 SOP Grounding Summary")
@@ -1166,10 +1287,52 @@ def generate_markdown_report(report: Dict[str, Any]) -> str:
         _add()
         section_num += 1
 
+    # --- Similarity Matrix ---
+    sim_data = report.get("similarity_matrix")
+    if sim_data:
+        _add(f"## {section_num}. Embedding Similarity Matrix")
+        _add()
+        _add("Cosine similarity between every auto node (rows) and human node (columns).")
+        _add("Cells show similarity scores. **Bold** = LLM-confirmed match.")
+        _add()
+
+        h_ids = sim_data["human_ids"]
+        a_ids = sim_data["auto_ids"]
+        matrix = sim_data["matrix"]
+
+        # Build set of LLM-confirmed pairs for bolding
+        confirmed_pairs: Set[Tuple[str, str]] = set()
+        for p in report.get("matched_pairs", []):
+            confirmed_pairs.add((p["auto_id"], p["human_id"]))
+
+        # Header row — use short IDs (last 20 chars)
+        h_short = [h[:20] for h in h_ids]
+        header = "| Auto \\\\ Human | " + " | ".join(f"`{h}`" for h in h_short) + " |"
+        sep = "|---|" + "|".join("---" for _ in h_ids) + "|"
+        _add(header)
+        _add(sep)
+
+        for i, a_id in enumerate(a_ids):
+            cells = []
+            for j, h_id in enumerate(h_ids):
+                val = matrix[i][j]
+                cell = f"{val:.2f}"
+                if (a_id, h_id) in confirmed_pairs:
+                    cell = f"**{cell}**"
+                elif val >= 0.70:
+                    cell = f"*{cell}*"
+                cells.append(cell)
+            _add(f"| `{a_id[:20]}` | " + " | ".join(cells) + " |")
+
+        _add()
+        _add("Legend: **bold** = LLM-confirmed match, *italic* = above embedding threshold but not matched by LLM")
+        _add()
+        section_num += 1
+
     # --- Key Takeaways ---
     _add(f"## {section_num}. Key Takeaways")
     _add()
-    takeaways = _generate_takeaways(m, auto_only, human_only)
+    takeaways = _generate_takeaways(m)
     for t in takeaways:
         _add(f"- {t}")
     _add()
@@ -1197,7 +1360,7 @@ def _interpret_precision(score: float, kind: str = "node") -> str:
     return f"Poor — auto graph has many ungrounded {kind}s"
 
 
-def _generate_takeaways(m: Dict, auto_only: List, human_only: List) -> List[str]:
+def _generate_takeaways(m: Dict) -> List[str]:
     takeaways = []
 
     # Overall quality
@@ -1293,9 +1456,6 @@ def main():
     parser.add_argument("--sop", help="Path to original SOP document (enables grounding check)")
     parser.add_argument("--output", "-o", help="Path to save full report JSON")
     parser.add_argument("--md", help="Path to save markdown report (e.g. comparison_report.md)")
-    parser.add_argument("--threshold", type=float, default=ALIGNMENT_THRESHOLD,
-                        help=f"Alignment similarity threshold (default: {ALIGNMENT_THRESHOLD})")
-
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
@@ -1310,7 +1470,6 @@ def main():
     report = generate_report(
         auto_graph, human_graph,
         sop_text=sop_text,
-        threshold=args.threshold,
     )
 
     if args.output:
