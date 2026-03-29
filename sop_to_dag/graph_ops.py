@@ -268,6 +268,85 @@ def generate_adjacency_map(nodes: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+_CONFIDENCE_RANK = {"high": 2, "medium": 1, "low": 0}
+_RANK_TO_CONFIDENCE = {v: k for k, v in _CONFIDENCE_RANK.items()}
+
+
+def _lower_confidence(a: str, b: str) -> str:
+    """Return the lower of two confidence levels."""
+    rank = min(_CONFIDENCE_RANK.get(a, 0), _CONFIDENCE_RANK.get(b, 0))
+    return _RANK_TO_CONFIDENCE.get(rank, "low")
+
+
+def _can_merge(
+    node_a: Dict[str, Any],
+    node_b: Dict[str, Any],
+    b_id: str,
+    nodes: Dict[str, Any],
+) -> bool:
+    """Check whether node_a and node_b can be merged (both instruction, same role/system, B has 1 incoming)."""
+    if node_b.get("type") != "instruction":
+        return False
+    if node_a.get("role") != node_b.get("role"):
+        return False
+    if node_a.get("system") != node_b.get("system"):
+        return False
+    # B must have exactly one incoming edge
+    incoming = sum(
+        1 for n in nodes.values()
+        if n.get("next") == b_id
+        or (n.get("options") and b_id in n["options"].values())
+    )
+    return incoming == 1
+
+
+def merge_sequential_instructions(
+    nodes: Dict[str, Any],
+) -> Tuple[Dict[str, Any], int]:
+    """Collapse overly granular sequential instruction chains.
+
+    Merges A→B when both are instructions with the same role/system and B has
+    exactly one incoming edge. Chains extend greedily (A→B→C all merge into A).
+
+    Returns (nodes, merge_count).
+    """
+    merged_count = 0
+    visited: set = set()
+
+    for node_id in list(nodes.keys()):
+        if node_id in visited or node_id not in nodes:
+            continue
+
+        current_id = node_id
+        while True:
+            current = nodes.get(current_id)
+            if not current or current.get("type") != "instruction":
+                break
+
+            next_id = current.get("next")
+            if not next_id or next_id not in nodes:
+                break
+
+            next_node = nodes[next_id]
+            if not _can_merge(current, next_node, next_id, nodes):
+                break
+
+            # Merge next_node into current
+            current["text"] = current["text"] + ". " + next_node["text"]
+            current["next"] = next_node.get("next")
+            current["confidence"] = _lower_confidence(
+                current.get("confidence", "high"),
+                next_node.get("confidence", "high"),
+            )
+            del nodes[next_id]
+            visited.add(next_id)
+            merged_count += 1
+
+        visited.add(current_id)
+
+    return nodes, merged_count
+
+
 def compact_nodes_repr(nodes: Dict[str, Any]) -> str:
     """Compact text representation of nodes for analyser LLM calls.
 
@@ -475,25 +554,19 @@ def analyse(state: GraphState) -> GraphState:
         and context_result["is_valid"]
     )
 
-    # Build categorized feedback for the refiner (one patch per category)
-    categorized_feedback: Dict[str, str] = {}
+    # Build categorized feedback — each category is a list of individual issues
+    categorized_feedback: Dict[str, List[str]] = {}
     if has_topo_issues:
-        categorized_feedback["topological"] = (
-            f"Fix these topological issues: {topo_report}"
-        )
+        topo_lines = [line.strip() for line in topo_report.split("\n") if line.strip()]
+        categorized_feedback["topological"] = topo_lines
     if not completeness.is_complete:
-        categorized_feedback["completeness"] = (
-            f"Add the following missing branches/steps to the graph: "
-            f"{completeness.missing_branches}"
-        )
+        categorized_feedback["completeness"] = list(completeness.missing_branches)
     if not context_result["is_valid"]:
-        categorized_feedback["context"] = (
-            f"Fix these logical adjacency issues between connected nodes: "
-            f"{context_result['issues']}"
-        )
+        categorized_feedback["context"] = list(context_result["issues"])
 
-    # Also store the flat string for backward compat / logging
-    flat_feedback = "\n".join(categorized_feedback.values())
+    # Flat string for logging
+    all_issues = [issue for issues in categorized_feedback.values() for issue in issues]
+    flat_feedback = "\n".join(all_issues)
 
     state["is_complete"] = is_complete
     state["feedback"] = flat_feedback
@@ -840,11 +913,15 @@ class SchemaValidator:
 
 
 def refine(state: GraphState) -> GraphState:
-    """Run triplet verification -> per-category graph patching -> schema validation.
+    """Issue-by-issue refinement: each analyser issue gets its own resolver call.
 
-    Each issue category (topological, completeness, context, granularity, triplets)
-    gets its own GraphPatch call with a narrow mandate and independent rollback.
-    This prevents a single "fix everything" patch from causing collateral damage.
+    Order:
+      1. Triplet verification → collect invalid triplets as individual issues
+      2. LLM-based categories (completeness, context, triplets) — one resolver
+         call per issue line, so nothing gets skipped
+      3. Fresh topological scan — catches structural issues introduced by
+         the LLM patches above
+      4. Schema validation (deterministic)
 
     Mutates and returns the state with updated nodes and incremented iteration.
     """
@@ -853,7 +930,9 @@ def refine(state: GraphState) -> GraphState:
 
     nodes = state["nodes"]
     source_text = state["source_text"]
-    categorized_feedback = dict(state.get("categorized_feedback", {}))
+    categorized_feedback: Dict[str, List[str]] = {
+        k: list(v) for k, v in state.get("categorized_feedback", {}).items()
+    }
 
     triplet_verifier = TripletVerifier()
     patch_resolver = GraphPatchResolver()
@@ -869,46 +948,54 @@ def refine(state: GraphState) -> GraphState:
                      t.get("explanation", "")[:100])
 
     if invalid_triplets:
-        triplet_feedback = "\n".join(
-            f"Invalid triplet: {t['source_id']} --({t['edge_label']})--> "
+        categorized_feedback["triplets"] = [
+            f"{t['source_id']} --({t['edge_label']})--> "
             f"{t['target_id']}: {t['explanation']}"
             for t in invalid_triplets
-        )
-        categorized_feedback["triplets"] = (
-            f"Fix these invalid edge triplets:\n{triplet_feedback}"
-        )
+        ]
 
-    # 2. Per-category graph patching
-    category_order = ["topological", "completeness", "context", "triplets"]
-    applied_categories = []
+    # 2. LLM-based categories — one resolver call per issue
+    llm_categories = ["completeness", "context", "triplets"]
+    total_issues = 0
 
-    for category in category_order:
-        cat_feedback = categorized_feedback.get(category)
-        if not cat_feedback:
+    for category in llm_categories:
+        issues = categorized_feedback.get(category, [])
+        if not issues:
             continue
-
         logger.info(
-            "  [REFINER iter %d] Patching category '%s'...", iteration, category
+            "  [REFINER iter %d] Category '%s': %d issues",
+            iteration, category, len(issues),
         )
-        nodes_before = len(nodes)
-        nodes, patch = patch_resolver.resolve(nodes, cat_feedback, source_text)
-        nodes_after = len(nodes)
+        for i, issue in enumerate(issues):
+            logger.info("    [%s %d/%d] %s", category, i + 1, len(issues), issue[:120])
+            nodes_before = len(nodes)
+            nodes, patch = patch_resolver.resolve(nodes, issue, source_text)
+            changes = (
+                len(patch.add_nodes) + len(patch.modify_nodes) + len(patch.remove_nodes)
+            )
+            logger.info(
+                "      Nodes: %d -> %d (changes: %d)",
+                nodes_before, len(nodes), changes,
+            )
+            total_issues += 1
 
-        changes = (
-            len(patch.add_nodes) + len(patch.modify_nodes) + len(patch.remove_nodes)
-        )
-        logger.info(
-            "    [%s] Nodes: %d -> %d (delta: %+d, changes: %d). Reasoning: %s",
-            category, nodes_before, nodes_after, nodes_after - nodes_before,
-            changes, (patch.reasoning[:150] if patch.reasoning else "N/A"),
-        )
-        applied_categories.append(category)
+    # 3. Fresh topological scan — catches issues introduced by LLM patches
+    logger.info("  [REFINER iter %d] Step 3: Fresh topological scan...", iteration)
+    topo_report = get_graph_issues(nodes)
+    if topo_report != "Topology Valid.":
+        topo_lines = [line.strip() for line in topo_report.split("\n") if line.strip()]
+        logger.info("    %d topological issues found post-patch", len(topo_lines))
+        for i, issue in enumerate(topo_lines):
+            logger.info("    [topo %d/%d] %s", i + 1, len(topo_lines), issue)
+            nodes, patch = patch_resolver.resolve(
+                nodes, f"Fix this topological issue: {issue}", source_text,
+            )
+            total_issues += 1
+    else:
+        logger.info("    Topology: VALID")
 
-    if not applied_categories:
-        logger.info("  [REFINER iter %d] No categories to patch — skipping", iteration)
-
-    # 3. Schema validation (deterministic fixes)
-    logger.info("  [REFINER iter %d] Schema validation...", iteration)
+    # 4. Schema validation (deterministic fixes)
+    logger.info("  [REFINER iter %d] Step 4: Schema validation...", iteration)
     nodes, fix_msgs = schema_validator.validate_and_fix(nodes)
     if fix_msgs:
         for msg in fix_msgs:
@@ -924,8 +1011,8 @@ def refine(state: GraphState) -> GraphState:
         )
 
     logger.info(
-        "  [REFINER iter %d] Complete. %d nodes in graph. Categories patched: %s",
-        iteration, len(nodes), applied_categories or "none",
+        "  [REFINER iter %d] Complete. %d nodes in graph. %d issues patched.",
+        iteration, len(nodes), total_issues,
     )
     return state
 
@@ -1050,4 +1137,15 @@ def run_refinement(
                  final_state.get("iteration", 0),
                  final_state.get("is_complete", False),
                  len(final_state["nodes"]))
+
+    # Post-refinement: merge overly granular sequential instruction chains
+    nodes, merge_count = merge_sequential_instructions(final_state["nodes"])
+    if merge_count:
+        logger.info("[LOOP] Merged %d sequential instruction pairs post-refinement.", merge_count)
+        final_state["nodes"] = nodes
+        if dump_path:
+            (dump_path / "merged_graph.json").write_text(
+                json.dumps(nodes, indent=2)
+            )
+
     return final_state

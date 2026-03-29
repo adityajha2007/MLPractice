@@ -310,7 +310,7 @@ class GraphState(TypedDict):
     source_text: str
     nodes: Dict[str, Any]
     feedback: str
-    categorized_feedback: Dict[str, str]
+    categorized_feedback: Dict[str, List[str]]
     iteration: int
     is_complete: bool
     converter_id: str
