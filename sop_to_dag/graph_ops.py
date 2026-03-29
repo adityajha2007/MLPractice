@@ -20,7 +20,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
-from sop_to_dag.models import get_model
+from sop_to_dag.models import get_model, safe_invoke
 from sop_to_dag.schemas import (
     GranularityFeedback,
     GraphPatch,
@@ -415,7 +415,7 @@ def check_completeness(nodes: dict, source_text: str) -> RefineFeedback:
             )
         ),
     ]
-    return structured_llm.invoke(messages)
+    return safe_invoke(structured_llm, messages, context="completeness_check")
 
 
 def check_context(nodes: dict, source_text: str) -> Dict[str, Any]:
@@ -436,12 +436,8 @@ def check_context(nodes: dict, source_text: str) -> Dict[str, Any]:
         ),
     ]
 
-    try:
-        result = structured_llm.invoke(messages)
-        return {"is_valid": result.is_valid, "issues": result.issues}
-    except Exception as e:
-        logger.warning("Context check structured output failed: %s", e)
-        return {"is_valid": False, "issues": [f"Context check failed: {e}"]}
+    result = safe_invoke(structured_llm, messages, context="context_check")
+    return {"is_valid": result.is_valid, "issues": result.issues}
 
 
 def check_granularity(nodes: dict, source_text: str) -> GranularityFeedback:
@@ -460,14 +456,7 @@ def check_granularity(nodes: dict, source_text: str) -> GranularityFeedback:
         ),
     ]
 
-    try:
-        return structured_llm.invoke(messages)
-    except Exception as e:
-        logger.warning("Granularity check failed: %s", e)
-        return GranularityFeedback(
-            is_granular=False,
-            coarse_nodes=[],
-        )
+    return safe_invoke(structured_llm, messages, context="granularity_check")
 
 
 # ===========================================================================
@@ -669,18 +658,17 @@ class TripletVerifier:
         ]
 
         invalid = []
-        try:
-            verification = structured_llm.invoke(messages)
-            for r in verification.results:
-                if not r.is_valid and r.triplet_index < len(batch):
-                    invalid.append(
-                        {
-                            **batch[r.triplet_index],
-                            "explanation": r.explanation,
-                        }
-                    )
-        except Exception as e:
-            logger.warning("Triplet verification failed: %s", e)
+        verification = safe_invoke(
+            structured_llm, messages, context="triplet_verification"
+        )
+        for r in verification.results:
+            if not r.is_valid and r.triplet_index < len(batch):
+                invalid.append(
+                    {
+                        **batch[r.triplet_index],
+                        "explanation": r.explanation,
+                    }
+                )
 
         return invalid
 
@@ -795,16 +783,9 @@ class GraphPatchResolver:
             ),
         ]
 
-        try:
-            patch = structured_llm.invoke(messages)
-        except Exception as e:
-            logger.warning("GraphPatchResolver structured output failed: %s", e)
-            try:
-                patch = structured_llm.invoke(messages)
-            except Exception as e2:
-                logger.warning("GraphPatchResolver retry also failed: %s", e2)
-                empty_patch = GraphPatch(reasoning=f"Resolution failed: {e2}")
-                return nodes, empty_patch
+        patch = safe_invoke(
+            structured_llm, messages, context="patch_resolver"
+        )
 
         changes = (
             len(patch.add_nodes)

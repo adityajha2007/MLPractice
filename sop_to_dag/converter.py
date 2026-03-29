@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from sop_to_dag.graph_ops import apply_patch, generate_adjacency_map, get_graph_issues
-from sop_to_dag.models import get_model
+from sop_to_dag.models import get_model, safe_invoke
 from sop_to_dag.graph_ops import SchemaValidator
 from sop_to_dag.schemas import GraphPatch, InitialGraph, WorkflowNode
 
@@ -166,30 +166,25 @@ def _llm_call(stage: str, system: str, human: str, **format_kwargs) -> str:
         SystemMessage(content=system),
         HumanMessage(content=human.format(**format_kwargs)),
     ]
-    response = llm.invoke(messages)
+    response = safe_invoke(llm, messages, context=f"llm_call/{stage}")
     return response.content.strip()
 
 
 def _structured_llm_call(
-    stage: str, schema, system: str, human: str, retries: int = 2, **format_kwargs
+    stage: str, schema, system: str, human: str, **format_kwargs
 ):
-    """Structured output LLM call with retry. Returns a Pydantic model instance."""
+    """Structured output LLM call. Returns a Pydantic model instance.
+
+    Halts the pipeline on non-200 responses (via safe_invoke) so the
+    checkpoint system can handle recovery.
+    """
     llm = get_model(stage)
     structured_llm = llm.with_structured_output(schema)
     messages = [
         SystemMessage(content=system),
         HumanMessage(content=human.format(**format_kwargs)),
     ]
-    last_error = None
-    for attempt in range(1, retries + 1):
-        try:
-            return structured_llm.invoke(messages)
-        except Exception as e:
-            last_error = e
-            logger.warning(
-                "  Structured output attempt %d/%d failed: %s", attempt, retries, e
-            )
-    raise last_error
+    return safe_invoke(structured_llm, messages, context=f"structured/{stage}")
 
 
 def _to_snake_case(text: str) -> str:

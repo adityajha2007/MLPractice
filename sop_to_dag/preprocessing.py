@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 
-from sop_to_dag.models import get_embeddings, get_model
+from sop_to_dag.models import get_embeddings, get_model, safe_invoke
 from sop_to_dag.schemas import (
     DependencyQueries,
     DependencyReview,
@@ -96,31 +96,35 @@ Grade each retrieval. Return a DependencyReview with grades for each document.
 """
 
 _CONDENSATION_SYSTEM = """\
-You are a Context Condensation Specialist. You receive a chunk of SOP text that
-was retrieved as potentially relevant context for a specific query.
+You are a Context Condensation Specialist. A workflow-graph builder will use your
+output to understand how this SOP chunk connects to the rest of the document.
 
-Your job: extract ONLY the information from the retrieved text that is directly
-relevant to the query. Produce a concise 2-4 sentence summary that captures the
-key facts, specific values, team names, system references, or process steps that
-address the query.
+You receive:
+- A chunk of SOP text
+- Context snippets retrieved from OTHER parts of the same SOP
+
+Your job: produce ONE short, factual context note that tells the graph builder
+what cross-chunk dependencies, upstream triggers, downstream handoffs, or shared
+entities this chunk relies on.
 
 Rules:
-1. Do NOT reproduce the full retrieved text — condense it.
-2. Include specific details (codes, thresholds, team names, system names) that
-   are relevant to the query.
-3. If the retrieved text has very little relevance, return a single sentence.
+1. Be brutally concise — every sentence must carry a specific fact (a team name,
+   system, threshold, condition, or handoff). Cut anything vague or redundant.
+2. Drop any retrieved snippet that adds nothing useful to understanding this chunk.
+3. Do NOT repeat information already present in the chunk itself.
 4. Do NOT add information that is not in the retrieved text.
+5. Merge overlapping facts — no duplicates.
+6. Target 2-4 sentences. Use fewer if less context is relevant.
 """
 
 _CONDENSATION_HUMAN = """\
-## Query (the dangling reference being resolved)
-{query}
+## Chunk
+{chunk_text}
 
-## Retrieved Text
-{retrieved_text}
+## Retrieved Context from Other Sections
+{retrieved_sections}
 
-Condense the retrieved text into a brief context note relevant to the query.
-Return ONLY the condensed text — no preamble.
+Write the context note. Return ONLY the note — no labels, no preamble.
 """
 
 _ENTITY_RESOLUTION_SYSTEM = """\
@@ -168,17 +172,11 @@ def agentic_chunk(state: RAGPrepState) -> RAGPrepState:
         HumanMessage(content=_CHUNKING_HUMAN.format(document=state["document"])),
     ]
 
-    try:
-        result = structured_llm.invoke(messages)
-        state["chunks"] = [c.model_dump() for c in result.chunks]
-        logger.info("  Produced %d chunks: %s",
-                     len(state["chunks"]),
-                     [c["title"] for c in state["chunks"]])
-    except Exception as e:
-        logger.warning("  Chunking failed, falling back to single chunk: %s", e)
-        state["chunks"] = [
-            {"chunk_id": 0, "title": "Full Document", "text": state["document"]}
-        ]
+    result = safe_invoke(structured_llm, messages, context="chunking")
+    state["chunks"] = [c.model_dump() for c in result.chunks]
+    logger.info("  Produced %d chunks: %s",
+                 len(state["chunks"]),
+                 [c["title"] for c in state["chunks"]])
 
     return state
 
@@ -222,9 +220,9 @@ def enrich_chunks(state: RAGPrepState) -> RAGPrepState:
         queries = _generate_queries(llm_query, chunk_id, chunk_text)
         logger.info("    %d queries generated", len(queries))
 
-        # Step 2 + 3 + 4: Retrieve, grade, and condense
-        condensed_notes: List[str] = []
+        # Step 2 + 3: Retrieve and grade per query, collect accepted text
         query_texts: List[str] = []
+        accepted_sections: List[str] = []  # "Query: ...\n<accepted text>"
 
         for dep in queries:
             query_texts.append(dep.query)
@@ -246,26 +244,29 @@ def enrich_chunks(state: RAGPrepState) -> RAGPrepState:
             logger.info("    Query '%s': %d/%d retrievals accepted",
                          dep.query[:60], len(accepted_docs), len(docs))
 
-            if not accepted_docs:
-                continue
+            if accepted_docs:
+                combined = "\n\n".join(doc.page_content for doc in accepted_docs)
+                accepted_sections.append(f"Query: {dep.query}\n{combined}")
 
-            # Condense accepted retrievals into a brief context note
-            combined_text = "\n\n".join(doc.page_content for doc in accepted_docs)
-            note = _condense_context(llm_condense, dep.query, combined_text)
-            if note:
-                condensed_notes.append(note)
-                logger.info("    Condensed context: %d chars -> %d chars",
-                             len(combined_text), len(note))
+        # Step 4: One condensation call per chunk (all queries combined)
+        condensed_context = ""
+        if accepted_sections:
+            total_chars = sum(len(s) for s in accepted_sections)
+            condensed_context = _condense_context(
+                llm_condense, chunk_text, "\n\n---\n\n".join(accepted_sections)
+            )
+            logger.info("    Condensed %d chars of retrievals -> %d char note",
+                         total_chars, len(condensed_context))
 
         enriched_chunk = EnrichedChunk(
             chunk_id=chunk_id,
             chunk_text=chunk_text,
-            retrieved_context="\n\n".join(condensed_notes),
+            retrieved_context=condensed_context,
             generated_queries=query_texts,
         )
         enriched.append(enriched_chunk.model_dump())
-        ctx_len = len(enriched_chunk.retrieved_context)
-        logger.info("    Chunk %d enriched: %d chars of condensed context", chunk_id, ctx_len)
+        logger.info("    Chunk %d enriched: %d chars of condensed context",
+                     chunk_id, len(condensed_context))
 
     state["enriched_chunks"] = enriched
     logger.info("  Enrichment complete: %d chunks processed", len(enriched))
@@ -289,12 +290,8 @@ def resolve_entities(state: RAGPrepState) -> RAGPrepState:
         HumanMessage(content=_ENTITY_RESOLUTION_HUMAN.format(chunks_text=chunks_text)),
     ]
 
-    try:
-        entity_map = structured_llm.invoke(messages)
-        mappings = [m.model_dump() for m in entity_map.mappings]
-    except Exception as e:
-        logger.warning("Entity resolution failed: %s", e)
-        mappings = []
+    entity_map = safe_invoke(structured_llm, messages, context="entity_resolution")
+    mappings = [m.model_dump() for m in entity_map.mappings]
 
     logger.info("  Found %d entity mappings", len(mappings))
     for m in mappings:
@@ -331,12 +328,8 @@ def _generate_queries(llm, chunk_id: int, chunk_text: str) -> List:
             )
         ),
     ]
-    try:
-        result = structured_llm.invoke(messages)
-        return result.queries
-    except Exception as e:
-        logger.warning("Query generation failed for chunk %d: %s", chunk_id, e)
-        return []
+    result = safe_invoke(structured_llm, messages, context=f"query_gen/chunk_{chunk_id}")
+    return result.queries
 
 
 def _grade_retrievals(llm, query: str, docs) -> List[bool]:
@@ -353,30 +346,22 @@ def _grade_retrievals(llm, query: str, docs) -> List[bool]:
             )
         ),
     ]
-    try:
-        result = structured_llm.invoke(messages)
-        return [g.is_relevant for g in result.grades]
-    except Exception as e:
-        logger.warning("Retrieval grading failed for query '%s': %s", query, e)
-        return [False] * len(docs)
+    result = safe_invoke(structured_llm, messages, context="retrieval_grading")
+    return [g.is_relevant for g in result.grades]
 
 
-def _condense_context(llm, query: str, retrieved_text: str) -> str:
-    """Condense retrieved chunk text into a brief relevance note."""
+def _condense_context(llm, chunk_text: str, retrieved_sections: str) -> str:
+    """Condense all retrieved context for a chunk into one unified note."""
     messages = [
         SystemMessage(content=_CONDENSATION_SYSTEM),
         HumanMessage(
             content=_CONDENSATION_HUMAN.format(
-                query=query, retrieved_text=retrieved_text
+                chunk_text=chunk_text, retrieved_sections=retrieved_sections
             )
         ),
     ]
-    try:
-        response = llm.invoke(messages)
-        return response.content.strip()
-    except Exception as e:
-        logger.warning("Context condensation failed for query '%s': %s", query[:60], e)
-        return ""
+    response = safe_invoke(llm, messages, context="condensation")
+    return response.content.strip()
 
 
 def _apply_entity_map(text: str, mappings: List[dict]) -> str:
