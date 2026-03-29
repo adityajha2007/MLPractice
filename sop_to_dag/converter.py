@@ -1,129 +1,156 @@
-"""SOP-to-DAG pipeline converter.
+"""SOP-to-DAG pipeline converter (v4 — graph-first).
 
-Step 1 (Outline):      LLM converts full enriched SOP -> plain-text outline
-Step 2 (Detail pass):  For each chunk, LLM compares against outline and fills gaps
-Step 3 (Graph Build):  Deterministic parser+builder: text outline -> WorkflowNodes
+Step 1 (Graph Gen):     LLM converts full enriched SOP -> graph JSON directly
+Step 2 (Graph Refine):  For each chunk, LLM produces a patch to add/modify/remove nodes
 
-The LLM produces plain text only — no structured output wrestling. Step 3
-is pure compilation with no hallucination.
+The LLM produces structured graph output from the start — no lossy text-outline
+intermediate. This preserves temporal dependencies, decision scope, and branch
+history that indentation-based outlines lose.
 """
 
 import json
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from sop_to_dag.graph_ops import apply_patch, generate_adjacency_map, get_graph_issues
 from sop_to_dag.models import get_model
+from sop_to_dag.graph_ops import SchemaValidator
+from sop_to_dag.schemas import GraphPatch, InitialGraph, WorkflowNode
 
 logger = logging.getLogger(__name__)
 
-from sop_to_dag.schemas import (
-    ActionStep,
-    ConditionalBlock,
-    Procedure,
-    PseudocodeBlock,
-    StepItem,
-)
 
 # ---------------------------------------------------------------------------
-# Inline prompts — LLM produces PLAIN TEXT, not structured output
+# Inline prompts — LLM produces STRUCTURED GRAPH OUTPUT
 # ---------------------------------------------------------------------------
 
-_OUTLINE_SYSTEM = """\
-You are a Process Logic Engineer. Convert an SOP document into a plain-text
-numbered outline that captures the COMPLETE workflow.
+_GRAPH_SYSTEM = """\
+You are a Process Logic Engineer. Convert an SOP document directly into a \
+workflow DAG (directed acyclic graph) represented as a list of nodes.
 
-FORMAT RULES (follow exactly):
-- Sequential actions: numbered lines
-  Example: 1. Begin processing the indirect dispute
-- Decision points: prefix with "DECISION:" and phrase as a YES/NO question
-  Example: 2. DECISION: Is the dispute code 183 or 186?
-- Branches: indented YES: / NO: blocks under decisions
-  Example:
-    2. DECISION: Is the dispute code 183 or 186?
-      YES:
-        3. Check if borrower mentions fraud indicators
-      NO:
-        4. Check force memo for fraud keywords
-- Nested decisions: just indent further
-- Steps AFTER a decision (where both branches converge): un-indent back
-  Example:
-    2. DECISION: Is the item in stock?
-      YES:
-        3. Ship the item
-      NO:
-        4. Notify the customer of backorder
-    5. Update order status  ← both branches lead here
-- External references: include "Refer to: <document name>" in the step text
+Each node must follow this EXACT schema:
+{
+  "id": "snake_case_id",          // 2-4 word snake_case identifier
+  "type": "<type>",               // One of: "instruction", "question", "terminal", "reference"
+  "text": "Description",          // Self-explanatory action or question text
+  "next": "next_node_id" | null,  // For instruction/reference: ID of next node. Null for question/terminal.
+  "options": {"Yes": "id", "No": "id"} | null,  // For question nodes ONLY. Null otherwise.
+  "external_ref": "Doc Name" | null,  // For reference nodes: name of external document
+  "role": "Role Name" | null,     // Who performs this action (if specified in SOP)
+  "system": "System Name" | null, // Software or tool used (if specified in SOP)
+  "confidence": "high"            // "high" = explicit in SOP, "medium" = inferred, "low" = guess
+}
+
+NODE TYPE RULES:
+- "instruction": A sequential action step. MUST have "next" pointing to another node ID.
+- "question": A decision point. MUST have "options" with Yes/No keys. "next" must be null.
+  Question text MUST end with "?".
+- "terminal": End of a process path. "next" and "options" must both be null.
+- "reference": Like instruction but links to an external document. MUST have "next" and "external_ref".
+
+STRUCTURE RULES:
+1. The FIRST node must have id="start".
+2. There must be at least one terminal node (typically id="end").
+3. Every instruction/reference node must have "next" pointing to a valid node ID.
+4. Every question node must have "options" with at least "Yes" and "No" keys.
+5. All node IDs referenced in "next" or "options" must exist as node IDs in your output.
+6. After a decision where both branches converge, both branches' last nodes should \
+point to the same convergence node.
 
 CONTENT RULES:
-1. Break the process down into HIGHLY DETAILED micro-operations. Capture every specific action.
-2. For every step or decision, append metadata tags at the end of the line if applicable:
-   - [Role: <who does this>]
-   - [System: <software or tool used>]
-   Example: 1. Click the 'Dispute' tab [Role: Analyst] [System: Mainframe]
-3. Cover ALL decision paths — every branch must lead somewhere.
-4. Cross-section references must be inlined as actual steps inside the relevant branch.
-5. Preserve ALL detail from the SOP — every decision, action, and reference.
-6. Do NOT add preamble, headers, or commentary. Output ONLY the numbered outline.
+1. Capture MAXIMUM detail — every specific click, check, data entry, decision point, \
+and cross-section dependency mentioned in the SOP. Do NOT summarize or collapse \
+multiple actions into one node. Each distinct action gets its own node.
+2. Include role and system metadata when the SOP specifies who does what and in which tool.
+3. Cross-section references should use type="reference" with the document name in external_ref.
+4. Set confidence to "medium" when inferring a connection not explicitly stated, \
+"low" when guessing to maintain connectivity.
+
+EXAMPLE (simple decision flow):
+Input: "Open the case. If fraud detected, escalate to supervisor. Otherwise, close the case."
+Output nodes:
+[
+  {"id": "start", "type": "instruction", "text": "Open the case", "next": "is_fraud_detected_question", "options": null, "external_ref": null, "role": null, "system": null, "confidence": "high"},
+  {"id": "is_fraud_detected_question", "type": "question", "text": "Is fraud detected?", "next": null, "options": {"Yes": "escalate_to_supervisor", "No": "close_the_case"}, "external_ref": null, "role": null, "system": null, "confidence": "high"},
+  {"id": "escalate_to_supervisor", "type": "instruction", "text": "Escalate case to supervisor", "next": "end", "options": null, "external_ref": null, "role": null, "system": null, "confidence": "high"},
+  {"id": "close_the_case", "type": "instruction", "text": "Close the case", "next": "end", "options": null, "external_ref": null, "role": null, "system": null, "confidence": "high"},
+  {"id": "end", "type": "terminal", "text": "End of procedure.", "next": null, "options": null, "external_ref": null, "role": null, "system": null, "confidence": "high"}
+]
+
+EXAMPLE (reference node):
+{"id": "refer_fraud_guide", "type": "reference", "text": "Refer to Fraud Resolution Guide for escalation procedures", "next": "next_step_id", "options": null, "external_ref": "Fraud Resolution Guide", "role": "Analyst", "system": null, "confidence": "high"}
+
+In your reasoning field, provide a detailed analysis of the SOP structure: \
+identify all decision points, branches, convergence points, cross-section \
+dependencies, and the overall process flow before producing the nodes.
 """
 
-_OUTLINE_HUMAN = """\
-Convert this SOP into a numbered outline following the format rules exactly.
+_GRAPH_HUMAN = """\
+Convert this SOP into a workflow graph following the schema exactly. \
+Capture every detail — do not summarize or skip steps.
 
 {enriched_sop}
 """
 
-_DETAIL_PASS_SYSTEM = """\
-You are a Detail Verification Engineer. You compare a single SOP section against
-an existing workflow outline to find MISSING details.
+_PATCH_SYSTEM = """\
+You are a Graph Refinement Engineer. You compare a specific SOP section/chunk \
+against an existing workflow graph to find MISSING or INCORRECT details.
 
 You receive:
-- The current outline (covers the full SOP so far)
-- One specific SOP section/chunk to verify against the outline
+- The current graph as an adjacency map (showing connections)
+- The current graph as full JSON (showing all node details)
+- One specific SOP section/chunk to verify against the graph
 
 Your job:
 1. Read the SOP section carefully
-2. Check if every action, decision, reference, and detail from that section
-   is captured in the outline
-3. If anything is MISSING — add it in the correct location
-4. If the section references external documents/guides not in the outline — add them
-5. Do NOT remove existing steps. You MAY expand a single coarse step into
-   multiple detailed sub-steps if the SOP section describes multiple distinct
-   actions that the step collapses into one line.
-6. Do NOT add steps that aren't in the SOP section
-7. If a chunk contains an action but the condition/decision for that action is
-   missing, look at the current outline to infer where it belongs based on
-   surrounding process steps.
-8. Do NOT connect disconnected steps to the end of the outline — insert orphaned
-   context in the correct position based on process flow.
-9. Use the Previous and Next Section Context to understand where the current
-   section fits in the overall process flow.
+2. Check if every action, decision, reference, and detail from that section \
+is captured in the graph
+3. If anything is MISSING — add it via add_nodes
+4. If any existing node is INCORRECT or needs updating — fix it via modify_nodes
+5. If any node should be removed — list it in remove_nodes
+6. Do NOT remove or restructure nodes that are correct
+7. Do NOT add nodes for content not in this SOP section
 
-Return the COMPLETE updated outline (all existing steps + any additions).
-If nothing is missing, return the outline unchanged.
+PATCH RULES:
+- When ADDING nodes: ensure their "next"/"options" point to existing node IDs \
+or other newly added node IDs. Wire them into the graph correctly.
+- When MODIFYING nodes: include ALL fields of the node (the entire node dict \
+will be replaced). Match by "id".
+- When REMOVING nodes: ensure no remaining nodes reference the removed IDs. \
+If they do, include those referencing nodes in modify_nodes with updated \
+"next"/"options" values.
+- For INSERTING a node between A and B: add the new node N with next=B, \
+and modify node A to have next=N.
+- For INSERTING a decision that splits a chain A→B: add the question node Q \
+and any new branch nodes, modify A to point to Q, and ensure branch ends \
+point to B (or wherever they should converge).
 
-Use the same format: numbered steps, DECISION: prefix for questions, indented
-YES:/NO: blocks, self-explanatory step text. Output ONLY the outline.
+If the graph already captures this chunk completely, return empty lists \
+for add_nodes, modify_nodes, and remove_nodes.
+
+Node schema reminder:
+- instruction: must have "next", "options" must be null
+- question: must have "options" (Yes/No), "next" must be null, text ends with "?"
+- terminal: "next" and "options" both null
+- reference: must have "next" and "external_ref"
 """
 
-_DETAIL_PASS_HUMAN = """\
-## Current Outline
-{current_outline}
+_PATCH_HUMAN = """\
+## Current Graph (Adjacency Map)
+{adjacency_map}
 
-## Previous Section Context (for reference only)
-{prev_context}
+## Current Graph (Full Nodes JSON)
+{nodes_json}
 
-## SOP Section to Verify
+## SOP Chunk to Verify
 {chunk_text}
 
-## Next Section Context (for reference only)
-{next_context}
-
-Return the complete updated outline with any missing details added.
+Return a GraphPatch with any additions, modifications, or removals needed. \
+If the graph already captures this chunk completely, return empty lists.
 """
 
 
@@ -141,6 +168,28 @@ def _llm_call(stage: str, system: str, human: str, **format_kwargs) -> str:
     ]
     response = llm.invoke(messages)
     return response.content.strip()
+
+
+def _structured_llm_call(
+    stage: str, schema, system: str, human: str, retries: int = 2, **format_kwargs
+):
+    """Structured output LLM call with retry. Returns a Pydantic model instance."""
+    llm = get_model(stage)
+    structured_llm = llm.with_structured_output(schema)
+    messages = [
+        SystemMessage(content=system),
+        HumanMessage(content=human.format(**format_kwargs)),
+    ]
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return structured_llm.invoke(messages)
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "  Structured output attempt %d/%d failed: %s", attempt, retries, e
+            )
+    raise last_error
 
 
 def _to_snake_case(text: str) -> str:
@@ -170,552 +219,40 @@ def _reassemble_enriched_sop(
     return "\n\n".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Outline parser: plain text -> PseudocodeBlock
-# ---------------------------------------------------------------------------
-
-
-def parse_outline(text: str) -> PseudocodeBlock:
-    """Parse a plain-text numbered outline into a PseudocodeBlock.
-
-    Handles:
-      "3. Do something"              -> ActionStep
-      "4. DECISION: Is it valid?"    -> ConditionalBlock
-      "  YES:" / "  NO:"             -> branches (indented content)
-      Nested decisions               -> recursive parsing
-
-    Returns a PseudocodeBlock with one Procedure.
-    """
-    lines = text.strip().split("\n")
-    steps, _ = _parse_lines(lines, 0, base_indent=0)
-    return PseudocodeBlock(procedures=[Procedure(name="SOP", steps=steps)])
-
-
-def _get_indent(line: str) -> int:
-    """Count leading spaces."""
-    return len(line) - len(line.lstrip())
-
-
-def _parse_lines(
-    lines: List[str], start: int, base_indent: int
-) -> Tuple[List[StepItem], int]:
-    """Recursively parse lines at a given indentation level.
-
-    Returns (steps, next_line_index).
-    """
-    steps: List[StepItem] = []
-    i = start
-
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-
-        # Skip blank lines
-        if not stripped:
-            i += 1
-            continue
-
-        indent = _get_indent(line)
-
-        # If we've de-indented past our level, we're done with this block
-        if indent < base_indent:
-            break
-
-        # Branch markers (YES: / NO:) are handled by the decision parser
-        if stripped.upper() in ("YES:", "NO:"):
-            break
-
-        # Try to parse a numbered step
-        step_match = re.match(r"^(\d+)\.\s*(.*)", stripped)
-        if not step_match:
-            # Non-numbered line — skip (could be stray text)
-            i += 1
-            continue
-
-        step_text = step_match.group(2).strip()
-
-        # Check if this is a DECISION
-        decision_match = re.match(r"^DECISION:\s*(.*)", step_text, re.IGNORECASE)
-        if decision_match:
-            condition = decision_match.group(1).strip()
-            cond_id = _to_snake_case(condition)
-            if not cond_id.endswith("_question"):
-                cond_id += "_question"
-
-            i += 1  # move past the DECISION line
-
-            # Parse YES: and NO: branches
-            if_true, i = _parse_branch(lines, i, "YES:", indent)
-            if_false, i = _parse_branch(lines, i, "NO:", indent)
-
-            steps.append(StepItem(conditional=ConditionalBlock(
-                id=cond_id,
-                condition=condition,
-                if_true=if_true,
-                if_false=if_false,
-            )))
-        else:
-            # Regular action step
-            step_id = _to_snake_case(step_text)
-            steps.append(StepItem(action_step=ActionStep(
-                id=step_id,
-                action=step_text,
-            )))
-            i += 1
-
-    return steps, i
-
-
-def _parse_branch(
-    lines: List[str], start: int, marker: str, parent_indent: int
-) -> Tuple[List[StepItem], int]:
-    """Parse a YES: or NO: branch block.
-
-    Looks for the marker line, then parses indented content under it.
-    Returns (steps, next_line_index).
-    """
-    i = start
-
-    # Skip blank lines looking for the branch marker
-    while i < len(lines) and not lines[i].strip():
-        i += 1
-
-    if i >= len(lines):
-        return [], i
-
-    stripped = lines[i].strip()
-    if stripped.upper() != marker.upper():
-        # No branch marker found — return empty branch
-        return [], i
-
-    i += 1  # move past the marker
-
-    # Determine the indentation of the branch content.
-    # Content must be indented deeper than the parent (DECISION line).
-    # If the first non-blank line is at or before parent indent, the branch is empty.
-    content_indent = None
-    for j in range(i, min(i + 5, len(lines))):
-        if lines[j].strip():
-            candidate = _get_indent(lines[j])
-            if candidate > parent_indent:
-                content_indent = candidate
-            break
-
-    if content_indent is None:
-        return [], i
-
-    steps, i = _parse_lines(lines, i, base_indent=content_indent)
-    return steps, i
-
-
-# ---------------------------------------------------------------------------
-# Direct text-to-graph parser (no PseudocodeBlock intermediate)
-# ---------------------------------------------------------------------------
-
-_TERMINAL_KEYWORDS = [
-    "end processing", "end of process", "end of procedure",
-    "end the process", "end the procedure", "process complete",
-    "processing complete", "procedure complete", "no further action",
-    "stop processing", "workflow complete", "close the case",
-    "mark as complete", "mark as done", "mark onboarding as complete",
-    "end of onboarding",
-]
-
-_BuildResult = Tuple[Optional[str], List[str]]
-
-
-def parse_outline_to_graph(text: str) -> Dict[str, Any]:
-    """Parse a plain-text outline directly into graph nodes.
-
-    Combines parsing and graph building in one pass — no intermediate
-    PseudocodeBlock. Uses `_GraphBuilder` for node emission / convergence wiring.
-    """
-    builder = _GraphBuilder()
-    lines = text.strip().split("\n")
-
-    if not lines or not text.strip():
-        builder._add_terminal("end", "No steps found in procedure.")
-        return builder.nodes
-
-    results, _ = _parse_and_emit(builder, lines, 0, base_indent=0)
-    _, tails = _chain_results(builder, results)
-    if results:
-        first_head = results[0][0]
-        # Re-emit the first node with "start" id if it wasn't already
-        if first_head and first_head != "start" and "start" not in builder.nodes:
-            # Rename the first node to "start"
-            node_data = builder.nodes.pop(first_head)
-            node_data["id"] = "start"
-            builder.nodes["start"] = node_data
-            # Update any references to the old id
-            for n in builder.nodes.values():
-                if n.get("next") == first_head:
-                    n["next"] = "start"
-                if n.get("options"):
-                    for k, v in n["options"].items():
-                        if v == first_head:
-                            n["options"][k] = "start"
-            # Update tails list
-            tails = ["start" if t == first_head else t for t in tails]
-
-    builder._terminate_tails(tails)
-    builder._ensure_terminals()
-    return builder.nodes
-
-
-def _parse_and_emit(
-    builder: "_GraphBuilder",
-    lines: List[str],
-    start: int,
-    base_indent: int,
-    force_first_id: Optional[str] = None,
-) -> Tuple[List[_BuildResult], int]:
-    """Recursively parse lines and emit graph nodes directly.
-
-    Returns (list of _BuildResult, next_line_index).
-    """
-    results: List[_BuildResult] = []
-    i = start
-
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-
-        if not stripped:
-            i += 1
-            continue
-
-        indent = _get_indent(line)
-
-        if indent < base_indent:
-            break
-
-        if stripped.upper() in ("YES:", "NO:"):
-            break
-
-        step_match = re.match(r"^(\d+)\.\s*(.*)", stripped)
-        if not step_match:
-            i += 1
-            continue
-
-        step_text = step_match.group(2).strip()
-        use_id = force_first_id if (not results and force_first_id) else None
-
-        # Extract metadata tags
-        role_match = re.search(r"\[Role:\s*(.*?)\]", step_text, re.IGNORECASE)
-        system_match = re.search(r"\[System:\s*(.*?)\]", step_text, re.IGNORECASE)
-        role = role_match.group(1).strip() if role_match else None
-        system = system_match.group(1).strip() if system_match else None
-        clean_text = re.sub(r"\[(?:Role|System):\s*.*?\]", "", step_text, flags=re.IGNORECASE).strip()
-
-        decision_match = re.match(r"^DECISION:\s*(.*)", clean_text, re.IGNORECASE)
-        if decision_match:
-            condition = decision_match.group(1).strip()
-            cond_id = _to_snake_case(condition)
-            if not cond_id.endswith("_question"):
-                cond_id += "_question"
-
-            i += 1
-
-            true_results, i = _parse_branch_and_emit(builder, lines, i, "YES:", indent)
-            false_results, i = _parse_branch_and_emit(builder, lines, i, "NO:", indent)
-
-            true_result = _chain_results(builder, true_results)
-            false_result = _chain_results(builder, false_results)
-
-            result = builder._emit_conditional(
-                condition=condition,
-                cond_id=cond_id,
-                true_result=true_result,
-                false_result=false_result,
-                forced_id=use_id,
-                role=role,
-                system=system,
-            )
-            results.append(result)
-        else:
-            action_text = clean_text
-            step_id = _to_snake_case(action_text)
-            result = builder._emit_action(
-                action_text=action_text,
-                action_id=step_id,
-                forced_id=use_id,
-                role=role,
-                system=system,
-            )
-            results.append(result)
-            i += 1
-
-    return results, i
-
-
-def _parse_branch_and_emit(
-    builder: "_GraphBuilder",
-    lines: List[str],
-    start: int,
-    marker: str,
-    parent_indent: int,
-) -> Tuple[List[_BuildResult], int]:
-    """Parse a YES:/NO: branch and emit nodes directly.
-
-    Returns (list of _BuildResult, next_line_index).
-    """
-    i = start
-
-    while i < len(lines) and not lines[i].strip():
-        i += 1
-
-    if i >= len(lines):
-        return [], i
-
-    stripped = lines[i].strip()
-    if stripped.upper() != marker.upper():
-        return [], i
-
-    i += 1
-
-    content_indent = None
-    for j in range(i, min(i + 5, len(lines))):
-        if lines[j].strip():
-            candidate = _get_indent(lines[j])
-            if candidate > parent_indent:
-                content_indent = candidate
-            break
-
-    if content_indent is None:
-        return [], i
-
-    results, i = _parse_and_emit(builder, lines, i, base_indent=content_indent)
-    return results, i
-
-
-# ---------------------------------------------------------------------------
-# Deterministic graph builder
-# ---------------------------------------------------------------------------
-
-def _chain_results(builder: "_GraphBuilder", step_results: List[_BuildResult]) -> _BuildResult:
-    """Wire a sequence of _BuildResults: each step's tails → next step's head.
-
-    Returns the overall (first_head, last_tails).
-    """
-    if not step_results:
-        return None, []
-
-    for j in range(len(step_results) - 1):
-        _, prev_tails = step_results[j]
-        next_head, _ = step_results[j + 1]
-        if next_head is None:
-            continue
-        for tail_id in prev_tails:
-            node = builder.nodes[tail_id]
-            if node["type"] in ("instruction", "reference") and node["next"] is None:
-                node["next"] = next_head
-
-    return step_results[0][0], step_results[-1][1]
-
-
-class _GraphBuilder:
-    """Deterministic walker: PseudocodeBlock -> Dict[str, node_data].
-
-    Walks the pseudocode tree and emits WorkflowNodes:
-      ActionStep       -> instruction node (or reference/terminal via detection)
-      ConditionalBlock -> question node (options map to branch heads)
-
-    Key design: every emit function returns (head_id, tail_ids).
-      - head_id:  the entry point of the emitted subgraph
-      - tail_ids: nodes whose `next` is None and needs to be wired by the caller
-
-    This lets branches CONVERGE: after a conditional, both branches' tails get
-    wired to whatever step comes next in the parent list. No orphans.
-    """
-
-    def __init__(self):
-        self.nodes: Dict[str, Dict[str, Any]] = {}
-        self._id_counter: Dict[str, int] = {}
-        self._shared_terminal_id: Optional[str] = None
-
-    def _unique_id(self, base: str) -> str:
-        """Generate a unique snake_case ID, appending _2, _3, etc. on clash."""
-        if base not in self.nodes and base not in self._id_counter:
-            self._id_counter[base] = 1
-            return base
-        self._id_counter.setdefault(base, 1)
-        self._id_counter[base] += 1
-        return f"{base}_{self._id_counter[base]}"
-
-    def build(self, pseudocode: PseudocodeBlock) -> Dict[str, Any]:
-        """Walk all procedures and return the complete nodes dict."""
-        all_steps: List[StepItem] = []
-        for proc in pseudocode.procedures:
-            all_steps.extend(proc.steps)
-
-        if not all_steps:
-            self._add_terminal("end", "No steps found in procedure.")
-            return self.nodes
-
-        _, tails = self._walk_steps(all_steps, force_first_id="start")
-        self._terminate_tails(tails)
-        self._ensure_terminals()
-        return self.nodes
-
-    def _walk_steps(
-        self,
-        steps: List[StepItem],
-        force_first_id: Optional[str] = None,
-    ) -> _BuildResult:
-        if not steps:
-            return None, []
-
-        step_results: List[_BuildResult] = []
-
-        for i, step in enumerate(steps):
-            use_id = force_first_id if (i == 0 and force_first_id) else None
-
-            if step.conditional:
-                cond = step.conditional
-                true_result = self._walk_steps(cond.if_true)
-                false_result = self._walk_steps(cond.if_false) if cond.if_false else (None, [])
-                result = self._emit_conditional(
-                    condition=cond.condition,
-                    cond_id=cond.id,
-                    true_result=true_result,
-                    false_result=false_result,
-                    forced_id=use_id,
-                )
-            elif step.action_step:
-                a = step.action_step
-                result = self._emit_action(
-                    action_text=a.action,
-                    action_id=a.id,
-                    target=a.target,
-                    forced_id=use_id,
-                )
-            else:
-                continue
-
-            step_results.append(result)
-
-        return _chain_results(self, step_results)
-
-    def _emit_action(
-        self,
-        action_text: str,
-        action_id: str | None = None,
-        target: str | None = None,
-        forced_id: str | None = None,
-        role: str | None = None,
-        system: str | None = None,
-    ) -> _BuildResult:
-        base_id = forced_id or action_id or _to_snake_case(action_text)
-        node_id = forced_id or self._unique_id(base_id)
-
-        external_ref = None
-        node_type = "instruction"
-
-        ref_match = re.search(
-            r"[Rr]efer(?:\s+to)?[:\s]+[\"']?([^\"'\n.]+)", action_text
-        )
-        if ref_match:
-            external_ref = ref_match.group(1).strip()
-            node_type = "reference"
-        elif target:
-            external_ref = target
-
-        lower = action_text.lower()
-        if any(kw in lower for kw in _TERMINAL_KEYWORDS):
-            tid = self._get_shared_terminal()
-            return tid, []
-
-        self.nodes[node_id] = {
-            "id": node_id,
-            "type": node_type,
-            "text": action_text,
-            "next": None,
-            "options": None,
-            "external_ref": external_ref,
-            "confidence": "high",
-            "role": role,
-            "system": system,
-        }
-        return node_id, [node_id]
-
-    def _emit_conditional(
-        self,
-        condition: str,
-        cond_id: str | None = None,
-        true_result: _BuildResult = (None, []),
-        false_result: _BuildResult = (None, []),
-        forced_id: str | None = None,
-        role: str | None = None,
-        system: str | None = None,
-    ) -> _BuildResult:
-        base_id = forced_id or cond_id or _to_snake_case(condition)
-        node_id = forced_id or self._unique_id(base_id)
-
-        true_head, true_tails = true_result
-        if true_head is None:
-            true_head = self._get_shared_terminal()
-            true_tails = []
-
-        false_head, false_tails = false_result
-        if false_head is None:
-            false_head = self._get_shared_terminal()
-            false_tails = []
-
-        question_text = condition.strip()
-        if not question_text.endswith("?"):
-            question_text += "?"
-
-        self.nodes[node_id] = {
-            "id": node_id,
-            "type": "question",
-            "text": question_text,
-            "next": None,
-            "options": {"Yes": true_head, "No": false_head},
-            "external_ref": None,
-            "confidence": "high",
-            "role": role,
-            "system": system,
-        }
-        return node_id, true_tails + false_tails
-
-    def _add_terminal(self, node_id: str, text: str) -> str:
-        nid = self._unique_id(node_id) if node_id in self.nodes else node_id
-        self.nodes[nid] = {
-            "id": nid, "type": "terminal", "text": text,
-            "next": None, "options": None, "external_ref": None,
-            "confidence": "high", "role": None, "system": None,
-        }
-        return nid
-
-    def _get_shared_terminal(self) -> str:
-        if self._shared_terminal_id and self._shared_terminal_id in self.nodes:
-            return self._shared_terminal_id
-        self._shared_terminal_id = self._add_terminal("end", "End of procedure.")
-        return self._shared_terminal_id
-
-    def _terminate_tails(self, tails: List[str]) -> None:
-        if not tails:
-            return
-        dangling = [
-            t for t in tails
-            if self.nodes[t]["type"] in ("instruction", "reference")
-            and self.nodes[t].get("next") is None
-        ]
-        if dangling:
-            term_id = self._get_shared_terminal()
-            for nid in dangling:
-                self.nodes[nid]["next"] = term_id
-
-    def _ensure_terminals(self):
-        dangling = [
-            nid for nid, data in self.nodes.items()
-            if data["type"] in ("instruction", "reference") and data.get("next") is None
-        ]
-        if dangling:
-            term_id = self._get_shared_terminal()
-            for nid in dangling:
-                self.nodes[nid]["next"] = term_id
+def _nodes_list_to_dict(nodes: List[WorkflowNode]) -> Dict[str, Dict[str, Any]]:
+    """Convert a list of WorkflowNode models to the standard nodes dict."""
+    result: Dict[str, Dict[str, Any]] = {}
+    for node in nodes:
+        data = node.model_dump()
+        result[data["id"]] = data
+    return result
+
+
+def _ensure_start_node(nodes: Dict[str, Dict[str, Any]]) -> None:
+    """Ensure the first node has id='start'. Renames in-place if needed."""
+    if "start" in nodes:
+        return
+    if not nodes:
+        return
+
+    # Pick the first node as start
+    first_id = next(iter(nodes))
+    node_data = nodes.pop(first_id)
+    node_data["id"] = "start"
+    # Rebuild dict with "start" first
+    new_nodes = {"start": node_data}
+    new_nodes.update(nodes)
+    nodes.clear()
+    nodes.update(new_nodes)
+
+    # Update all references to the old ID
+    for n in nodes.values():
+        if n.get("next") == first_id:
+            n["next"] = "start"
+        if n.get("options"):
+            for k, v in n["options"].items():
+                if v == first_id:
+                    n["options"][k] = "start"
 
 
 # ---------------------------------------------------------------------------
@@ -724,14 +261,13 @@ class _GraphBuilder:
 
 
 class PipelineConverter:
-    """Plain-text pipeline: SOP -> outline -> detail pass -> graph.
+    """Graph-first pipeline: SOP -> graph JSON -> chunk-by-chunk graph refinement.
 
-    Step 1: LLM produces a plain-text numbered outline (no structured output).
-    Step 2: Chunk-by-chunk detail pass fills in missing details.
-    Step 3: Direct text-to-graph build (no intermediate PseudocodeBlock).
+    Step 1: LLM produces a workflow graph directly from the full enriched SOP.
+    Step 2: Each enriched chunk is used to refine the graph via structured patches.
     """
 
-    converter_id = "pipeline_v3"
+    converter_id = "pipeline_v4"
 
     def convert(
         self,
@@ -753,43 +289,197 @@ class PipelineConverter:
         if dump_path:
             self._dump_stage(dump_path, "enriched_sop", enriched_sop)
 
-        # Step 1: Single-shot outline
-        cached_outline = self._load_cache(dump_path, "outline") if resume else None
-        if cached_outline:
-            logger.info("[CONVERTER Step 1/3] Loaded outline from cache.")
-            outline = cached_outline
+        validator = SchemaValidator()
+
+        # ----- Step 1/2: Full SOP -> Graph (structured output) -----
+        cached_graph = self._load_cache(dump_path, "initial_graph") if resume else None
+        if cached_graph:
+            logger.info("[CONVERTER Step 1/2] Loaded initial graph from cache.")
+            nodes = json.loads(cached_graph)
         else:
-            logger.info("[CONVERTER Step 1/3] Generating outline (%d chars)...", len(enriched_sop))
-            outline = _llm_call(
-                stage="code_based",
-                system=_OUTLINE_SYSTEM,
-                human=_OUTLINE_HUMAN,
+            logger.info(
+                "[CONVERTER Step 1/2] Generating graph from SOP (%d chars)...",
+                len(enriched_sop),
+            )
+            result: InitialGraph = _structured_llm_call(
+                stage="graph_gen",
+                schema=InitialGraph,
+                system=_GRAPH_SYSTEM,
+                human=_GRAPH_HUMAN,
                 enriched_sop=enriched_sop,
             )
-            logger.info("  Outline: %d lines", outline.count("\n") + 1)
+            nodes = _nodes_list_to_dict(result.nodes)
+            _ensure_start_node(nodes)
+            nodes, fixes = validator.validate_and_fix(nodes)
+            if fixes:
+                logger.info("  Schema fixes applied: %s", fixes)
+
+            # Edge integrity: check all next/options targets exist
+            topo_report = get_graph_issues(nodes)
+            if topo_report != "Topology Valid.":
+                logger.warning("  Initial graph topology issues: %s", topo_report)
+            else:
+                logger.info("  Initial graph topology: clean")
+
+            logger.info("  Initial graph: %d nodes", len(nodes))
 
             if dump_path:
-                self._dump_stage(dump_path, "outline", outline)
+                self._dump_stage(dump_path, "initial_graph", json.dumps(nodes, indent=2))
 
-        # Step 2: Chunk-by-chunk detail pass
-        cached_refined = self._load_cache(dump_path, "outline_refined") if resume else None
+        # ----- Step 2/2: Chunk-by-chunk graph refinement (multi-pass) -----
+        cached_refined = self._load_cache(dump_path, "final_graph") if resume else None
         if cached_refined:
-            logger.info("[CONVERTER Step 2/3] Loaded refined outline from cache.")
-            outline = cached_refined
+            logger.info("[CONVERTER Step 2/2] Loaded refined graph from cache.")
+            nodes = json.loads(cached_refined)
         elif enriched_chunks and len(enriched_chunks) > 1:
-            logger.info("[CONVERTER Step 2/3] Detail pass — %d chunks to verify...",
-                        len(enriched_chunks))
-            outline = self._detail_pass(outline, enriched_chunks)
-            logger.info("  Refined outline: %d lines", outline.count("\n") + 1)
+            num_passes = 2
+            total = len(enriched_chunks)
+            logger.info(
+                "[CONVERTER Step 2/2] Graph refinement — %d chunks × %d passes...",
+                total, num_passes,
+            )
+
+            for pass_num in range(1, num_passes + 1):
+                pass_changes = 0
+                logger.info("  --- Pass %d/%d ---", pass_num, num_passes)
+
+                # Resume: check for per-pass checkpoint
+                pass_cache_name = f"graph_after_pass_{pass_num}"
+                cached_pass = self._load_cache(dump_path, pass_cache_name) if resume else None
+                if cached_pass:
+                    logger.info("  Loaded pass %d graph from cache.", pass_num)
+                    nodes = json.loads(cached_pass)
+                    continue
+
+                # Resume: find the latest per-chunk checkpoint within this pass
+                start_chunk_idx = 1
+                if resume and dump_path:
+                    for check_idx in range(total, 0, -1):
+                        ckpt = self._load_cache(dump_path, f"graph_p{pass_num}_c{check_idx}")
+                        if ckpt:
+                            nodes = json.loads(ckpt)
+                            start_chunk_idx = check_idx + 1
+                            logger.info(
+                                "  Resuming pass %d from chunk %d/%d (loaded checkpoint).",
+                                pass_num, start_chunk_idx, total,
+                            )
+                            break
+
+                for idx, ec in enumerate(enriched_chunks, start=1):
+                    if idx < start_chunk_idx:
+                        continue
+
+                    chunk_text = ec.get("chunk_text", "")
+                    ctx = ec.get("retrieved_context", "").strip()
+                    if ctx:
+                        chunk_text += f"\n\n[Cross-reference context: {ctx}]"
+
+                    logger.info(
+                        "  Pass %d, chunk %d/%d (chunk %s)...",
+                        pass_num, idx, total, ec.get("chunk_id", idx - 1),
+                    )
+
+                    # Snapshot for rollback
+                    pre_patch = {nid: dict(data) for nid, data in nodes.items()}
+                    pre_patch_count = len(nodes)
+
+                    try:
+                        adjacency_map = generate_adjacency_map(nodes)
+                        nodes_json = json.dumps(nodes, indent=2)
+
+                        patch: GraphPatch = _structured_llm_call(
+                            stage="graph_refine",
+                            schema=GraphPatch,
+                            system=_PATCH_SYSTEM,
+                            human=_PATCH_HUMAN,
+                            adjacency_map=adjacency_map,
+                            nodes_json=nodes_json,
+                            chunk_text=chunk_text,
+                        )
+
+                        changes = (
+                            len(patch.add_nodes)
+                            + len(patch.modify_nodes)
+                            + len(patch.remove_nodes)
+                        )
+                        if changes == 0:
+                            logger.info("    No changes needed.")
+                            continue
+
+                        logger.info(
+                            "    Patch: +%d add, ~%d modify, -%d remove",
+                            len(patch.add_nodes),
+                            len(patch.modify_nodes),
+                            len(patch.remove_nodes),
+                        )
+
+                        # Dump patch reasoning for debugging
+                        if dump_path and patch.reasoning:
+                            reason_name = f"patch_p{pass_num}_c{idx}_reasoning"
+                            self._dump_stage(dump_path, reason_name, patch.reasoning)
+
+                        apply_patch(nodes, patch)
+                        nodes, fixes = validator.validate_and_fix(nodes)
+                        if fixes:
+                            logger.info("    Schema fixes: %s", fixes)
+
+                        # Topological validation after patch
+                        topo_report = get_graph_issues(nodes)
+                        if topo_report != "Topology Valid.":
+                            logger.warning("    Post-patch topology issues: %s", topo_report)
+
+                        # Sanity checks
+                        if len(nodes) < pre_patch_count * 0.7:
+                            logger.warning(
+                                "    Patch shrank graph from %d to %d nodes (>30%% loss) — rolling back.",
+                                pre_patch_count, len(nodes),
+                            )
+                            nodes = pre_patch
+                            continue
+
+                        if "start" not in nodes:
+                            logger.warning("    Patch removed 'start' node — rolling back.")
+                            nodes = pre_patch
+                            continue
+
+                        pass_changes += changes
+
+                    except Exception as e:
+                        logger.warning(
+                            "    Patch failed for chunk %d (%s) — keeping previous graph.",
+                            idx, e,
+                        )
+                        nodes = pre_patch
+
+                    # Checkpoint after each chunk so we can resume mid-pass
+                    if dump_path:
+                        self._dump_stage(
+                            dump_path,
+                            f"graph_p{pass_num}_c{idx}",
+                            json.dumps(nodes, indent=2),
+                        )
+
+                logger.info(
+                    "  Pass %d complete: %d total changes applied.", pass_num, pass_changes
+                )
+
+                # If pass 2 made no changes, the graph is stable
+                if pass_num > 1 and pass_changes == 0:
+                    logger.info("  No changes in pass %d — graph is stable.", pass_num)
+                    break
+
+                # Dump pass-level checkpoint
+                if dump_path:
+                    self._dump_stage(
+                        dump_path,
+                        pass_cache_name,
+                        json.dumps(nodes, indent=2),
+                    )
 
             if dump_path:
-                self._dump_stage(dump_path, "outline_refined", outline)
+                self._dump_stage(dump_path, "final_graph", json.dumps(nodes, indent=2))
         else:
-            logger.info("[CONVERTER Step 2/3] Skipped (single chunk / no chunks).")
-
-        # Step 3: Direct text-to-graph build
-        logger.info("[CONVERTER Step 3/3] Parsing outline and building graph...")
-        nodes = parse_outline_to_graph(outline)
+            logger.info("[CONVERTER Step 2/2] Skipped (single chunk / no chunks).")
 
         type_counts: Dict[str, int] = {}
         for n in nodes.values():
@@ -798,53 +488,7 @@ class PipelineConverter:
         logger.info("  Graph: %d nodes — %s", len(nodes), type_counts)
         logger.info("[CONVERTER] Complete.")
 
-        if dump_path:
-            self._dump_stage(dump_path, "final_graph", json.dumps(nodes, indent=2))
-
         return nodes
-
-    @staticmethod
-    def _detail_pass(outline: str, enriched_chunks: List[dict]) -> str:
-        """Chunk-by-chunk detail verification and gap-filling.
-
-        For each enriched chunk, asks the LLM: "Is anything from this chunk
-        missing in the outline?" If yes, the LLM adds it. The outline grows
-        more detailed with each pass while maintaining its structure.
-        """
-        current = outline
-        total = len(enriched_chunks)
-
-        for idx, ec in enumerate(enriched_chunks, start=1):
-            chunk_text = ec.get("chunk_text", "")
-            ctx = ec.get("retrieved_context", "").strip()
-            if ctx:
-                chunk_text += f"\n\n[Cross-reference context: {ctx}]"
-
-            # Sliding window: provide prev/next chunk text for context
-            prev_context = enriched_chunks[idx - 2].get("chunk_text", "") if idx >= 2 else ""
-            next_context = enriched_chunks[idx].get("chunk_text", "") if idx < len(enriched_chunks) else ""
-
-            logger.info("  Detail pass %d/%d (chunk %s)...",
-                        idx, total, ec.get("chunk_id", idx - 1))
-            try:
-                updated = _llm_call(
-                    stage="code_based",
-                    system=_DETAIL_PASS_SYSTEM,
-                    human=_DETAIL_PASS_HUMAN,
-                    current_outline=current,
-                    chunk_text=chunk_text,
-                    prev_context=prev_context,
-                    next_context=next_context,
-                )
-                # Basic sanity: the updated outline shouldn't be drastically shorter
-                if len(updated.strip().split("\n")) >= len(current.strip().split("\n")) * 0.7:
-                    current = updated
-                else:
-                    logger.warning("    Detail pass returned much shorter outline — keeping previous.")
-            except Exception as e:
-                logger.warning("    Detail pass failed for chunk %d (%s) — keeping previous.", idx, e)
-
-        return current
 
     @staticmethod
     def _load_cache(dump_dir: Optional[Path], name: str) -> Optional[str]:

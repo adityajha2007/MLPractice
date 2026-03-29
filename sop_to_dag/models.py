@@ -16,6 +16,9 @@ _TEMPERATURE_MAP = {
     # Analyser checks
     "completeness": 0.0,
     "context": 0.0,
+    # Graph-first converter
+    "graph_gen": 0.2,
+    "graph_refine": 0.1,
     # Refiner
     "triplet": 0.0,
     "resolver": 0.1,

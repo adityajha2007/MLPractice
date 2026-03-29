@@ -13,10 +13,10 @@ import sys
 from pathlib import Path
 
 from sop_to_dag.alternatives import BottomUpConverter, EdgeVertexConverter
-from sop_to_dag.analyser import get_graph_issues
+from sop_to_dag.graph_ops import get_graph_issues
 from sop_to_dag.converter import PipelineConverter
 from sop_to_dag.evaluation import compute_metrics
-from sop_to_dag.preprocessing_cache import cached_preprocessing
+from sop_to_dag.preprocessing import cached_preprocessing
 from sop_to_dag.schemas import GraphState
 from sop_to_dag.storage import GraphStore
 

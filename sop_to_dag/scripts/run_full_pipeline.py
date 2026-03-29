@@ -13,8 +13,8 @@ from datetime import datetime
 from pathlib import Path
 
 from sop_to_dag.converter import PipelineConverter
-from sop_to_dag.loop import run_refinement
-from sop_to_dag.preprocessing_cache import (
+from sop_to_dag.graph_ops import run_refinement
+from sop_to_dag.preprocessing import (
     cached_preprocessing,
     rebuild_vector_store,
 )

@@ -9,7 +9,7 @@ import logging
 import sys
 from pathlib import Path
 
-from sop_to_dag.loop import run_refinement
+from sop_to_dag.graph_ops import run_refinement
 from sop_to_dag.storage import GraphStore
 
 

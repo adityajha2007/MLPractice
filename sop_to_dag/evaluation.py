@@ -5,7 +5,7 @@ Provides quantitative metrics for comparing converter outputs.
 
 from typing import Any, Dict
 
-from sop_to_dag.analyser import get_all_issues_structured
+from sop_to_dag.graph_ops import get_all_issues_structured
 
 
 def compute_metrics(nodes: Dict[str, Any]) -> Dict[str, Any]:

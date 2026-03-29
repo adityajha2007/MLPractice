@@ -10,8 +10,9 @@ Raw SOP --> preprocessing --> [enriched chunks + entity map + FAISS index]
                     +-----------------+------------------+
                     |                                    |
              MAIN PATH                        COMPARISON ONLY
-             PipelineConverter                BottomUp / EdgeVertex
-             (3-stage: LLM+deterministic)    (produce graph for eval)
+             PipelineConverter (v4)          BottomUp / EdgeVertex
+             (graph-first: LLM structured    (produce graph for eval)
+              output + chunk patching)
                     |
              Refinement Loop
              (Analyser <-> Refiner)
@@ -26,14 +27,12 @@ sop_to_dag/
   schemas.py          # All Pydantic models + TypedDicts
   models.py           # LLM + embedding model factories
   storage.py          # GraphStore (file-based JSON persistence)
-  preprocessing.py        # Chunking + FAISS indexing + RAG enrichment + entity resolution
-  preprocessing_cache.py  # Content-based preprocessing cache (SHA-256 keyed)
-  converter.py             # Main 3-stage pipeline (Outline -> Detail Pass -> Direct Text-to-Graph)
+  preprocessing.py    # Chunking + FAISS + RAG enrichment + entity resolution + caching
+  converter.py        # Graph-first pipeline (Full SOP -> graph JSON -> chunk-by-chunk patching)
+  graph_ops.py        # Analysis + refinement + LangGraph self-refinement loop
   alternatives.py     # Research paper comparisons: BottomUp, EdgeVertex
-  analyser.py         # Topological + completeness + context + granularity checks
-  refiner.py          # Triplet verification + granularity expander + error resolver + schema validator
-  loop.py             # LangGraph StateGraph: Analyser <-> Refiner loop
   evaluation.py       # Metrics (node count, edge coverage, structural similarity)
+  CONVERTER_EXPLAINED.md  # Detailed walkthrough of converter.py internals
   scripts/
     run_converter.py      # SOP -> preprocessed -> JSON DAG
     run_refinement.py     # Load stored graph -> refine
@@ -41,15 +40,14 @@ sop_to_dag/
     compare_converters.py # Run all 3 converters, print metrics
   tests/
     fixtures/
-      sample_sop_fraud.md
       sample_sop_onboarding.md
     test_schemas.py
     test_topological.py
     test_storage.py
     test_validator.py
     test_metrics.py
-    test_graph_builder.py
-    test_outline_parser.py
+    test_patch_application.py
+    test_preprocessing_cache.py
 ```
 
 ## Setup
@@ -93,7 +91,17 @@ python -m sop_to_dag.scripts.run_refinement output/graphs/<graph_file>.json
 python -m sop_to_dag.scripts.compare_converters sop_to_dag/tests/fixtures/sample_sop_fraud.md
 ```
 
-### Caching and resuming
+### Run tests
+
+```bash
+python -m pytest sop_to_dag/tests/ -v
+```
+
+## Caching and Resuming
+
+Every stage saves checkpoints so you never lose progress on failure (e.g., token limit errors).
+
+### Preprocessing cache
 
 Preprocessing results (chunking, RAG enrichment, entity resolution) are automatically cached by SHA-256 of the SOP content. Subsequent runs for the same document skip preprocessing entirely.
 
@@ -104,27 +112,36 @@ python -m sop_to_dag.scripts.run_full_pipeline sop_to_dag/tests/fixtures/sample_
 # Second run (same SOP) — preprocessing is skipped, straight to conversion
 python -m sop_to_dag.scripts.run_full_pipeline sop_to_dag/tests/fixtures/sample_sop_fraud.md
 
-# Resume a specific run (reuses preprocessing cache + outline/detail pass from that run)
-python -m sop_to_dag.scripts.run_full_pipeline sop_to_dag/tests/fixtures/sample_sop_fraud.md \
-  --resume output/stage_dumps/sample_sop_fraud_20260326_150000
-
 # Force re-run preprocessing (e.g., after changing the chunking prompt)
 python -m sop_to_dag.scripts.run_full_pipeline sop_to_dag/tests/fixtures/sample_sop_fraud.md \
   --force-preprocess
 ```
 
-There are two caching layers:
+### Converter resume
 
-| Layer | Location | Keyed by | Automatic | What it caches |
-|-------|----------|----------|-----------|----------------|
-| Preprocessing cache | `output/preprocessing_cache/` | SOP content hash | Yes | Chunks, enriched chunks, entity map |
-| Run resume (`--resume`) | `output/stage_dumps/<run_dir>/` | Run directory path | Manual | Outline, refined outline, preprocessing dumps |
-
-### Run tests
+The converter checkpoints after every stage. Use `--resume` to pick up from where it left off:
 
 ```bash
-python -m pytest sop_to_dag/tests/ -v
+# Resume a crashed run — skips completed stages, resumes mid-chunk if needed
+python -m sop_to_dag.scripts.run_converter sop_to_dag/tests/fixtures/sample_sop_fraud.md \
+  --resume output/stage_dumps/sample_sop_fraud_20260326_150000
+
+python -m sop_to_dag.scripts.run_full_pipeline sop_to_dag/tests/fixtures/sample_sop_fraud.md \
+  --resume output/stage_dumps/sample_sop_fraud_20260326_150000
 ```
+
+### Refinement loop resume
+
+The refinement loop dumps graph state after every iteration. On resume, it loads the latest iteration checkpoint and continues from there.
+
+### Checkpoint summary
+
+| Stage | Checkpoints saved | Resume behavior |
+|-------|-------------------|-----------------|
+| Preprocessing | `output/preprocessing_cache/{sha}.json` | Automatic — skips on cache hit |
+| Converter Step 1 (graph gen) | `initial_graph.json` | Loads from cache, skips LLM call |
+| Converter Step 2 (chunk patching) | `graph_p{pass}_c{chunk}.json` per chunk, `graph_after_pass_{N}.json` per pass | Finds latest per-chunk checkpoint, resumes from there |
+| Refinement loop | `refine_iter{N}_graph.json` per iteration | Loads latest iteration, continues loop |
 
 ## Pipeline Stages
 
@@ -134,19 +151,19 @@ A 4-node LangGraph pipeline that always runs before conversion:
 
 - **Agentic chunking** -- LLM splits SOP at logical process boundaries (not mid-sentence)
 - **FAISS indexing** -- Embeds chunks using HuggingFace bge-base-en-v1.5 (local, no API cost)
-- **RAG enrichment** -- For each chunk, generates queries for dangling references, retrieves from FAISS, grades relevance, keeps valid context
+- **RAG enrichment** -- For each chunk, generates queries for dangling references, retrieves from FAISS, grades relevance, condenses accepted retrievals into brief context notes (not full chunks)
 - **Entity resolution** -- Groups synonymous terms (e.g., "CBRD team" / "Credit Bureau Reporting Disputes team") into canonical forms and normalizes all chunk text
-- **Content-based cache** -- Results are cached by SHA-256 of the SOP content. Subsequent runs for the same document skip preprocessing entirely. Use `--force-preprocess` to bypass.
 
 ### 2. Conversion (`converter.py`)
 
-3-stage pipeline — LLM produces plain text, then deterministic compilation:
+Graph-first pipeline — LLM produces structured graph JSON directly:
 
-- **Step 1 (Outline)** -- LLM converts the full enriched SOP into a plain-text numbered outline with `DECISION:` prefixed decision points, indented `YES:`/`NO:` branches, self-explanatory step text, and `[Role: X]`/`[System: Y]` metadata tags
-- **Step 2 (Detail Pass)** -- For each enriched chunk (with sliding window prev/next context), LLM verifies the outline captures every detail from that section — can add missing steps or expand coarse steps into sub-steps
-- **Step 3 (Direct Text-to-Graph)** -- Pure Python parser reads the outline, strips metadata tags into `role`/`system` node fields, and emits graph nodes directly — `numbered step -> instruction`, `DECISION: -> question`, terminal keywords -> `terminal`. No intermediate Pydantic models, no LLM — zero hallucination risk
+- **Step 1 (Graph Gen)** -- LLM converts the full enriched SOP into a workflow graph via structured output (`InitialGraph` Pydantic model). Produces `WorkflowNode` JSON directly — no lossy text-outline intermediate. Schema validation and topological checks run immediately after.
+- **Step 2 (Graph Refine)** -- For each enriched chunk (2 passes), LLM produces a `GraphPatch` (add/modify/remove operations) comparing the chunk against the current graph. Patches are applied with rollback safety (70% size threshold, start node protection). Pass 2 catches cross-chunk temporal dependencies that Pass 1 missed.
 
-### 3. Refinement Loop (`loop.py`)
+See `CONVERTER_EXPLAINED.md` for a detailed walkthrough of every function and class.
+
+### 3. Refinement Loop (`graph_ops.py`)
 
 LangGraph StateGraph cycling between analysis and repair:
 
@@ -163,9 +180,14 @@ For benchmarking only (no refinement loop):
 
 ## Key Features
 
+- **Graph-first conversion** -- LLM produces structured graph JSON from the start, preserving temporal dependencies, decision scope, and branch history that text-outline intermediates lose.
+- **Patch-based refinement** -- Each chunk produces a surgical `GraphPatch` (add/modify/remove) rather than regenerating the whole graph, preserving earlier correct work.
+- **Multi-pass chunk refinement** -- Pass 2 sees nodes added by Pass 1 from other chunks, enabling cross-chunk dependency wiring.
+- **Rollback safety** -- Every patch is applied against a snapshot. Catastrophic patches (>30% node loss or start node removal) are automatically rolled back.
 - **Confidence labels** -- Each node has `confidence: high|medium|low` indicating how directly its outgoing edges are supported by the SOP text. Low-confidence edges are verified first during refinement.
+- **Context condensation** -- RAG enrichment condenses retrieved chunks into brief relevance notes instead of dumping full chunk text, reducing noise and token usage.
 - **Entity resolution** -- Prevents duplicate nodes from inconsistent terminology across SOP sections.
-- **RAG-enhanced refinement** -- The error resolver can use the FAISS vector store to retrieve relevant SOP sections for surgical fixes.
+- **Checkpoint-based resume** -- Every stage saves checkpoints; crashed runs resume from the last successful point without re-running completed work.
 - **Inline prompts** -- Each module contains its own prompt constants co-located with the code that uses them.
 
 ## Configuration
@@ -174,4 +196,4 @@ The LLM backend is configured in `models.py`:
 
 - **Model**: `gpt-oss-120b` (configurable via `MODEL_NAME`)
 - **Embeddings**: `BAAI/bge-base-en-v1.5` (local HuggingFace model)
-- **Temperature**: Varies by stage (0.2 for converters, 0.0 for analysers, 0.1 for resolvers)
+- **Temperature**: Varies by stage (0.2 for graph gen, 0.1 for graph refine/resolvers, 0.0 for analysers)

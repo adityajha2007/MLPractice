@@ -22,20 +22,20 @@ Raw SOP Text
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────┐
-│  CONVERTER (converter.py) — Plain-Text Pipeline         │
+│  CONVERTER (converter.py) — Graph-First Pipeline (v4)   │
 │                                                         │
-│  Step 1  [LLM]  Full enriched SOP → plain-text outline  │
-│  Step 2  [LLM]  Chunk-by-chunk detail pass (gap-fill)   │
-│  Step 3  [CODE] Direct text-to-graph compile → JSON DAG │
+│  Step 1  [LLM]  Full enriched SOP → graph JSON directly │
+│  Step 2  [LLM]  Chunk-by-chunk graph patching (2 passes)│
 │                                                         │
-│  LLM's job ends after Step 2. Step 3 is pure code.      │
+│  Both steps use structured output (Pydantic models).    │
+│  No lossy text-outline intermediate.                    │
 └──────────────────────────┬──────────────────────────────┘
                            │
                       JSON DAG (nodes dict)
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────┐
-│  REFINEMENT LOOP (loop.py)                              │
+│  REFINEMENT LOOP (graph_ops.py)                         │
 │  LangGraph StateGraph: Analyser ↔ Refiner               │
 │  Cycles until all checks pass or max iterations          │
 └─────────────────────────────────────────────────────────┘
@@ -43,220 +43,170 @@ Raw SOP Text
 
 ---
 
-## Step 1: Outline — LLM Generates a Plain-Text Numbered Outline
+## Why Graph-First (v4 vs v3)
 
-**Input:** Full enriched SOP (reassembled from enriched chunks with cross-references inlined)
-**Output:** A plain-text numbered outline
-**Method:** LLM with plain-text output (no structured output wrestling)
+The previous v3 converter used a 3-step pipeline: LLM generates **text outline** → LLM refines **text** chunk-by-chunk → deterministic parser converts text to graph. The text outline was a lossy intermediate — it captured topology via indentation but lost longer temporal dependencies (cross-chunk decision scope, branch history, nested convergence semantics).
 
-The LLM reads the full SOP and produces a numbered outline that captures the complete workflow logic:
+v4 eliminates the text intermediate entirely: the LLM produces the **graph JSON directly** in Step 1, then each chunk refines the **graph** (not text) via structured patches in Step 2. This preserves richer structural information from the start and allows refinement to reason about graph topology directly.
 
 ```
-1. Begin processing indirect dispute
-2. DECISION: Is the dispute code 183 or 186?
-  YES:
-    3. Check if borrower mentions fraud indicators
-  NO:
-    4. Check force memo for fraud keywords
-5. Update order status
+OLD (v3): SOP → [LLM] → text outline → [LLM] → refined text → [parser] → graph
+NEW (v4): SOP → [LLM] → graph JSON   → [LLM per chunk] → patched graph
 ```
-
-**Format rules:**
-- Sequential actions: numbered lines (`1. Do something`)
-- Decision points: `DECISION:` prefix, phrased as YES/NO questions
-- Branches: indented `YES:` / `NO:` blocks under decisions
-- Convergence: un-indent back to show where branches rejoin
-- External references: inline `Refer to: <document name>` in step text
-
-**Why plain text instead of structured output:** The LLM produces better outlines when it can write freely in a simple numbered format. No schema wrestling, no field-level hallucination. The deterministic parser in Step 3 handles all the structuring.
-
-**Metadata tags:** The LLM appends `[Role: <who>]` and `[System: <tool>]` tags to each step when applicable. Example: `1. Click the 'Dispute' tab [Role: Analyst] [System: Mainframe]`. These tags are parsed out and stored as `role`/`system` fields on graph nodes in Step 3.
-
-**Prompt role:** `Process Logic Engineer` — focuses on capturing the COMPLETE workflow with highly detailed micro-operations, all decision paths covered, cross-section references inlined, and metadata tags for roles/systems.
 
 ---
 
-## Step 2: Detail Pass — Chunk-by-Chunk Gap Filling
+## Prompts
 
-**Input per call:** Current outline + one enriched SOP chunk
-**Output:** Updated outline with any missing details added
-**Method:** LLM with plain-text output, called sequentially for each chunk
+### `_GRAPH_SYSTEM` — Step 1 System Prompt
 
-Each enriched chunk is compared against the current outline. The LLM checks if every action, decision, reference, and detail from that section is captured, and adds anything missing in the correct location.
+Instructs the LLM (acting as a "Process Logic Engineer") to convert an SOP directly into a list of `WorkflowNode` JSON objects. Contains:
 
-**Rules:**
-1. Do NOT remove existing steps — you MAY expand a single coarse step into multiple detailed sub-steps if the SOP section describes multiple distinct actions collapsed into one line
-2. If the section references external documents not in the outline — add them
-3. Return the COMPLETE updated outline (all existing steps + additions)
-4. If nothing is missing, return the outline unchanged
-5. Insert orphaned context in the correct position based on process flow — do NOT append disconnected steps to the end
-6. Use the previous and next section context to understand where the current section fits
+- **Exact node schema** with all fields (`id`, `type`, `text`, `next`, `options`, `external_ref`, `role`, `system`, `confidence`)
+- **Node type rules** for each of the 4 types (`instruction`, `question`, `terminal`, `reference`) — what fields are required, what must be null
+- **Structure rules** — first node must be `id="start"`, must have a terminal `"end"` node, all referenced IDs must exist, branch convergence semantics
+- **Content rules** — capture MAXIMUM detail, include role/system metadata, use confidence levels (`high`=explicit, `medium`=inferred, `low`=guess)
+- **Two few-shot examples** — a simple decision flow and a reference node
 
-**Sliding window context:** Each detail pass call receives the previous and next chunk text alongside the current chunk, giving the LLM context about where this section fits in the overall process flow. This prevents orphaned steps from being appended to the end of the outline.
+### `_GRAPH_HUMAN` — Step 1 Human Prompt
 
-**Why this step exists:** The single-shot outline in Step 1 captures the overall structure well, but may miss specific codes, team names, threshold values, or cross-references that appear in individual SOP sections. The detail pass is a "diff and patch" that ensures no granular detail is lost.
+Simple template: tells the LLM to convert the SOP and passes the full enriched SOP text via `{enriched_sop}`.
 
-**Skip condition:** If there are 0–1 enriched chunks (single chunk or no preprocessing), this step is skipped.
+### `_PATCH_SYSTEM` — Step 2 System Prompt
 
-**LLM call count:** 1 (outline) + N (detail passes) = N+1 calls. For typical 3–6 chunk SOPs: 4–7 calls.
+Instructs the LLM (acting as a "Graph Refinement Engineer") to compare one SOP chunk against the existing graph and produce a `GraphPatch`. Contains:
+
+- **What the LLM receives** — adjacency map, full nodes JSON, one SOP chunk
+- **Patch operation rules** — how to add nodes (wire into graph), modify nodes (include ALL fields), remove nodes (update references first)
+- **Insertion patterns** — how to insert a node between A→B, how to insert a decision that splits a chain
+- **No-op rule** — if the chunk is already captured, return empty lists
+- **Node schema reminder** — so the LLM doesn't produce malformed nodes
+
+### `_PATCH_HUMAN` — Step 2 Human Prompt
+
+Template providing: `{adjacency_map}` (simplified text view of connections), `{nodes_json}` (full node details), `{chunk_text}` (the SOP section to verify).
 
 ---
 
-## Step 3: Direct Text-to-Graph Build — Pure Compilation
+## Helper Functions
 
-**Input:** Final refined plain-text outline
-**Output:** `Dict[str, node_data]` — the JSON DAG
-**Method:** Pure Python parser + graph builder in one pass. No LLM. Zero hallucination risk.
+### `_llm_call(stage, system, human, **format_kwargs) -> str`
 
-This is `parse_outline_to_graph()`. It reads the text outline and emits graph nodes directly using `_GraphBuilder` — no intermediate Pydantic model (like `PseudocodeBlock`) is constructed. The parser calls the builder's emit methods as it encounters each line.
+Plain-text LLM call — sends a system + human message pair and returns the raw text response. Uses `get_model(stage)` to get a `ChatOpenAI` instance with the appropriate temperature for the given stage. Not currently used in the v4 pipeline (retained for potential future use) but follows the same call pattern as the structured variant.
 
-### How Parsing Works
+### `_structured_llm_call(stage, schema, system, human, retries=2, **format_kwargs)`
 
-The parser (`_parse_and_emit`) walks lines recursively:
+The workhorse LLM call for the v4 pipeline. Sends a system + human message pair and returns a **Pydantic model instance** parsed from the LLM's structured output.
 
-| Outline pattern | What happens |
-|---|---|
-| `3. Do something [Role: Analyst] [System: CRM]` | Extracts `role`/`system` tags, strips them from text, calls `builder._emit_action("Do something", role="Analyst", system="CRM")` |
-| `4. DECISION: Is it valid?` | Parses YES/NO branches recursively, then calls `builder._emit_conditional(...)` |
-| `YES:` / `NO:` | Branch markers — triggers recursive sub-parse at deeper indent |
-| `5. Update status` (after un-indent) | Convergence — chained after the decision's branch tails |
+- Uses `llm.with_structured_output(schema)` to constrain the LLM to produce valid JSON matching the Pydantic model
+- **Retry logic**: if structured output parsing fails (e.g., malformed JSON from the LLM), retries up to `retries` times before raising
+- Used with `InitialGraph` in Step 1 and `GraphPatch` in Step 2
 
-**Metadata tag extraction:** Before checking for DECISION prefix, the parser extracts `[Role: X]` and `[System: Y]` tags using narrow regex (`\[(?:Role|System):\s*.*?\]`). This avoids stripping legitimate bracket content like `[Cross-reference context: ...]`. The cleaned text is used for node text and ID generation; the extracted values are stored as `role`/`system` fields on the node.
+### `_to_snake_case(text) -> str`
 
-### Mapping Rules
+Converts a text description to a snake_case node ID. Strips non-alphanumeric characters, lowercases, takes the first 4 words, joins with underscores. Falls back to `"node"` if the result is empty. Used for programmatic ID generation when needed.
 
-| Outline element | Graph node type | Description |
-|---|---|---|
-| Regular numbered step | `instruction` | A step to perform. Has `next` pointing to the following node. |
-| Step with "Refer to..." | `reference` | Same as instruction but includes `external_ref` field. |
-| Step with terminal keyword | `terminal` | End state. No outgoing edges. |
-| `DECISION:` step | `question` | Decision node. Has `options: {"Yes": node_id, "No": node_id}`. |
-| Empty branch / dangling end | `terminal` | Auto-generated end node. |
+### `_reassemble_enriched_sop(source_text, enriched_chunks) -> str`
 
-### The Head/Tails Convergence Pattern
+Reassembles enriched chunks into one continuous document for Step 1. For each chunk, includes the chunk text and appends any RAG-retrieved cross-reference context in `[Cross-reference context: ...]` brackets. If no enriched chunks exist, returns the raw `source_text` as-is.
 
-This is the key algorithm that makes the graph fully connected. Every emit function returns:
+### `_nodes_list_to_dict(nodes: List[WorkflowNode]) -> Dict[str, Dict[str, Any]]`
 
-```
-(head_id, tail_ids)
-```
+Converts the `List[WorkflowNode]` returned by the LLM's `InitialGraph` into the standard nodes dict format (`{node_id: node_data_dict}`). Calls `model_dump()` on each Pydantic model and keys by the node's `id` field.
 
-- **head_id**: The entry point of the emitted subgraph (the first node)
-- **tail_ids**: Nodes whose `next` is still `None` — they need to be wired to whatever comes after
+### `_ensure_start_node(nodes) -> None`
 
-#### How it works for each type:
+Ensures the first node in the graph has `id="start"`. If a `"start"` key already exists, does nothing. Otherwise:
 
-**Action → instruction:**
-```
-Returns (node_id, [node_id])
-         ↑ entry    ↑ this node's `next` is None, caller will wire it
-```
+1. Pops the first node from the dict
+2. Renames its `id` to `"start"`
+3. Rebuilds the dict with `"start"` first to preserve insertion order
+4. Updates **all references** to the old ID across the entire graph — scans every node's `next` field and every value in `options` dicts, replacing the old ID with `"start"`
 
-**Action → terminal:**
-```
-Returns (terminal_id, [])
-         ↑ entry        ↑ empty — nothing comes after a terminal
-```
+This is necessary because the LLM might name the first node something like `"begin_processing"` despite being told to use `"start"`.
 
-**Decision → question:**
-```
-                    ┌── Yes branch ──→ [steps...] → tail_A (next=None)
-  question_node ──┤
-                    └── No branch  ──→ [steps...] → tail_B (next=None)
+---
 
-Returns (question_id, [tail_A, tail_B])
-         ↑ entry       ↑ BOTH branches' exits need wiring
-```
+## Patch Application
 
-#### Chaining a step list (`_chain_results`):
+### `_apply_patch(nodes, patch: GraphPatch) -> Dict`
 
-When processing `[step1, step2, step3]`:
+Applies a `GraphPatch` to the existing nodes dict. The patch contains three operation lists, applied in this order:
 
-1. Emit step1 → get `(head1, tails1)`
-2. Emit step2 → get `(head2, tails2)`
-3. Emit step3 → get `(head3, tails3)`
-4. Wire: `tails1.next → head2`, `tails2.next → head3`
-5. Return: `(head1, tails3)` — first node is entry, last step's tails are exits
+1. **Add nodes** (`patch.add_nodes`) — inserts new nodes into the graph. If a node ID already exists, the add is **skipped** with a warning (prevents accidental overwrites).
 
-This is what makes **branch convergence** work:
+2. **Modify nodes** (`patch.modify_nodes`) — replaces existing nodes by ID. The entire node dict is replaced (not merged), so the LLM must include ALL fields. If the ID doesn't exist in the graph, the modify is **skipped** with a warning.
 
-```
-Steps: [DECISION: Is it valid?, "Continue processing"]
+3. **Remove nodes** (`patch.remove_nodes`) — deletes nodes by ID. Before deletion, checks for **dangling references** — if any remaining node's `next` or `options` still points to the removed ID, a warning is logged. The removal still proceeds (the modify_nodes list should have updated those references).
 
-1. Emit Decision:
-   question → Yes → handle_valid (tail)
-            → No  → handle_invalid (tail)
-   Returns: (question, [handle_valid, handle_invalid])
+Returns the mutated nodes dict.
 
-2. Emit "Continue processing":
-   Returns: (continue, [continue])
+---
 
-3. Chain: handle_valid.next → continue
-          handle_invalid.next → continue    ← CONVERGENCE!
+## PipelineConverter Class
 
-4. Return: (question, [continue])
-```
+### Overview
 
-Both branches merge into the same downstream node. This works recursively for nested conditionals at any depth.
+The main converter class. Exposes a single `convert()` method that takes raw SOP text + optional enriched chunks and returns a fully-connected JSON DAG.
 
-### Walk-through Example
+- **`converter_id = "pipeline_v4"`** — identifies this converter version in logs and stored graph metadata.
 
-Given this outline:
-```
-1. Receive dispute
-2. DECISION: Is code 183?
-  YES:
-    3. Route to fraud
-  NO:
-    4. Route to standard
-5. Send confirmation email
-6. End processing
-```
+### `convert(source_text, enriched_chunks, dump_dir, resume) -> Dict[str, Any]`
 
-The parser+builder produces:
+The main entry point. Runs the full 2-step pipeline:
 
-```
-start ──→ is_code_183_question
-(Receive       │
- dispute)  ┌─Yes─┴──No──┐
-           ▼             ▼
-     route_to_fraud  route_to_standard
-           │             │
-           └──────┬──────┘
-                  ▼
-        send_confirmation_email
-                  │
-                  ▼
-              end ← TERMINAL (keyword detected)
-```
+#### Setup
 
-### Node Detection
+- Creates the dump directory if `dump_dir` is provided (for debugging/caching)
+- Calls `_reassemble_enriched_sop()` to combine chunks into one document
+- Dumps the enriched SOP to disk
+- Instantiates a `SchemaValidator` (from `graph_ops.py`) for deterministic fixes
 
-**Terminal detection** — if the step text (lowered) contains any of these keywords, it routes to the shared terminal:
-- "end processing", "end of process", "end of procedure"
-- "process complete", "no further action", "workflow complete"
-- "close the case", "mark as complete", "mark as done"
-- (and more — 16 keywords total)
+#### Step 1/2 — Full SOP → Graph
 
-**Reference detection** — regex match on `Refer to: <name>` or `Refer <name>`:
-- Sets `node_type = "reference"` and populates `external_ref`
+Generates the initial graph from the full enriched SOP in one LLM call.
 
-### Confidence Labels
+1. **Cache check**: if `resume=True` and an `initial_graph` file exists in `dump_dir`, loads from cache and skips the LLM call
+2. **LLM call**: `_structured_llm_call(stage="graph_gen", schema=InitialGraph, ...)` — the LLM produces an `InitialGraph` with a `reasoning` field (detailed analysis) and a `nodes` list
+3. **Post-processing**:
+   - `_nodes_list_to_dict()` converts the list to the standard dict format
+   - `_ensure_start_node()` renames the first node to `"start"` if needed
+   - `SchemaValidator.validate_and_fix()` applies deterministic fixes (e.g., terminal nodes get `next` cleared, questions without options become instructions)
+   - `get_graph_issues()` checks for orphans, broken links, and dead ends — logs warnings if found
+4. **Dump**: saves `initial_graph.json` to disk
 
-| Confidence | Meaning | When assigned |
-|---|---|---|
-| `high` | Directly stated in SOP | All nodes from explicit outline steps |
-| `low` | Inferred for connectivity | Auto-generated terminals from `_terminate_tails` or `_ensure_terminals` |
+#### Step 2/2 — Chunk-by-Chunk Graph Refinement (Multi-Pass)
 
-Low-confidence nodes are prioritized during the refinement loop — the `TripletVerifier` checks these edges first.
+Iterates over enriched chunks to add missing granular details to the graph. Runs **2 passes** over all chunks — the second pass sees nodes added by the first, catching cross-chunk temporal dependencies.
 
-### Safety Nets
+**Skip condition**: if there are 0–1 enriched chunks, this step is skipped entirely.
 
-After the main parse, two safety passes run:
+For each pass, for each chunk:
 
-1. **`_terminate_tails(tails)`** — Any tail nodes still dangling at the top level get wired to a shared terminal node (marked `confidence: "low"`)
+1. **Chunk preparation**: assembles chunk text + any RAG cross-reference context
+2. **Snapshot**: deep-copies the current nodes dict for rollback safety
+3. **LLM call**: `_structured_llm_call(stage="graph_refine", schema=GraphPatch, ...)` — receives the adjacency map, full nodes JSON, and chunk text. Returns a `GraphPatch` with add/modify/remove operations
+4. **No-op check**: if all three operation lists are empty, skips to next chunk
+5. **Patch reasoning dump**: if `dump_dir` is set, saves the LLM's reasoning to `patch_p{pass}_c{chunk}_reasoning.txt` for debugging
+6. **Apply patch**: calls `_apply_patch()` to mutate the graph
+7. **Schema validation**: `SchemaValidator.validate_and_fix()` cleans up any schema issues introduced by the patch
+8. **Topological validation**: `get_graph_issues()` checks graph integrity after the patch
+9. **Rollback checks** — two safety conditions trigger a full rollback to the pre-patch snapshot:
+   - **Size sanity**: if the graph shrank to less than 70% of its pre-patch size (prevents a bad patch from wiping the graph)
+   - **Start node protection**: if the `"start"` node was removed
+10. **Error handling**: if the LLM call or patch application throws, rolls back to the pre-patch snapshot and continues
 
-2. **`_ensure_terminals()`** — Final sweep: any `instruction` or `reference` node with `next=None` gets a terminal. This catches edge cases the parser might miss
+**Early termination**: if pass 2 makes zero changes across all chunks, the graph is considered stable and further passes are skipped.
+
+After all passes, dumps `final_graph.json` and logs a type distribution summary (how many instruction/question/terminal/reference nodes).
+
+### `_load_cache(dump_dir, name) -> Optional[str]`
+
+Static method. Checks if a cached stage output exists in `dump_dir` — tries both `.txt` and `.json` extensions. Returns the file content if found, `None` otherwise. Used when `resume=True` to skip expensive LLM calls for stages that already completed.
+
+### `_dump_stage(dump_dir, name, content) -> None`
+
+Static method. Writes a stage output to disk. Automatically picks the file extension — `.json` if the content starts with `{` or `[`, otherwise `.txt`. Used for debugging (inspect intermediate outputs) and caching (resume from a failed run).
 
 ---
 
@@ -302,26 +252,46 @@ The final output is a Python dict mapping node IDs to node data:
 
 ---
 
-## Backward Compatibility
+## Pydantic Models (from schemas.py)
 
-The old path through `PseudocodeBlock` still works:
-- `parse_outline(text)` returns a `PseudocodeBlock` (Pydantic model tree)
-- `_GraphBuilder.build(pseudocode)` accepts a `PseudocodeBlock` and returns nodes
+### `InitialGraph`
 
-These are retained for tests and backward compatibility but are no longer used in the production pipeline. The production path is `parse_outline_to_graph(text)` which goes directly from text to graph nodes.
+The structured output schema for Step 1. Fields:
+- **`reasoning: str`** — detailed analysis of the SOP structure, decision points, branches, convergence points, and cross-section dependencies. The LLM writes this before producing nodes, acting as a chain-of-thought.
+- **`nodes: List[WorkflowNode]`** — the complete workflow graph as a list of nodes.
+
+### `GraphPatch`
+
+The structured output schema for Step 2. Fields:
+- **`reasoning: str`** — what this chunk adds/changes and why.
+- **`add_nodes: List[WorkflowNode]`** — new nodes to insert (default: empty list).
+- **`modify_nodes: List[WorkflowNode]`** — existing nodes to replace by ID (default: empty list).
+- **`remove_nodes: List[str]`** — IDs of nodes to delete (default: empty list).
+
+### `WorkflowNode`
+
+The core node model with validation:
+- Terminal nodes get `next` and `options` force-cleared to `null`
+- Question nodes must have `options` (validation error otherwise)
+- Instruction nodes must have `next` (validation error otherwise)
+- Question text should end with `?`
 
 ---
 
 ## What Makes This Design Work
 
-1. **Plain-text outline as the LLM's only job.** The LLM writes a simple numbered list — no schema wrestling, no field-level hallucination. The format is natural for the model to produce and trivial for deterministic code to parse.
+1. **Graph from the start.** The LLM produces structured graph JSON directly — no lossy text-outline intermediate that loses temporal dependencies, decision scope, or branch history.
 
-2. **Detail pass ensures granularity.** The chunk-by-chunk verification (with sliding window prev/next context) catches specific codes, team names, and threshold values the single-shot outline may have glossed over. It can also expand coarse steps into sub-steps. The outline grows more detailed with each pass.
+2. **Structured output via Pydantic.** `with_structured_output()` constrains the LLM to produce valid JSON matching the schema. Retry logic handles the occasional parsing failure.
 
-3. **Direct text-to-graph with no intermediate models.** `parse_outline_to_graph` reads text and emits graph nodes in one pass. No `PseudocodeBlock` construction means no ~50+ Pydantic model instances allocated and immediately discarded.
+3. **Patch-based refinement preserves existing work.** Each chunk produces a surgical `GraphPatch` (add/modify/remove) rather than regenerating the whole graph. This prevents earlier correct work from being lost during refinement.
 
-4. **Head/tails pattern prevents orphaned nodes.** Every emit function returns (head_id, tail_ids). Both branches' exit points bubble up to the parent, which wires them to the next step. Convergence is automatic at any nesting depth.
+4. **Multi-pass catches cross-chunk dependencies.** Pass 2 sees nodes that Pass 1 added from other chunks. A decision in chunk 3 that references a branch target added from chunk 5 in Pass 1 can be wired correctly in Pass 2.
 
-5. **Confidence labels drive refinement priority.** The refinement loop knows which edges to verify first — low-confidence auto-terminals are checked before high-confidence SOP-stated edges.
+5. **Rollback safety prevents catastrophic patches.** Every patch is applied against a snapshot. If the graph shrinks by >30% or loses the start node, the entire patch is rolled back and the previous graph is preserved.
 
-6. **LLM narrows ambiguity, code compiles structure.** Steps 1–2 use the LLM for what it's good at (understanding natural language, identifying decision logic). Step 3 uses deterministic code for what it's good at (building a correct, connected graph with no hallucination).
+6. **Topological validation after every patch.** `get_graph_issues()` catches orphans, broken links, and dead ends immediately after each patch — issues surface early rather than accumulating.
+
+7. **Confidence labels drive refinement priority.** Downstream in the refinement loop, the `TripletVerifier` checks low-confidence edges first — the ones most likely to be incorrect.
+
+8. **Full graph context for patches.** The LLM sees the complete adjacency map and full nodes JSON for every patch, not just a local window. This enables coordinated multi-node changes (e.g., inserting a decision that splits a chain requires modifying the upstream node AND adding the new nodes).

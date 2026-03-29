@@ -100,6 +100,41 @@ class GranularityFeedback(BaseModel):
     coarse_nodes: List[CoarseNode] = Field(default_factory=list)
 
 
+class InitialGraph(BaseModel):
+    """LLM output for zero-shot SOP-to-graph conversion."""
+
+    reasoning: str = Field(
+        description=(
+            "Detailed analysis of the SOP structure, decision points, branches, "
+            "convergence points, and cross-section dependencies."
+        )
+    )
+    nodes: List[WorkflowNode]
+
+
+class GraphPatch(BaseModel):
+    """A patch to apply to an existing workflow graph."""
+
+    reasoning: str = Field(
+        description="What this chunk adds/changes and why."
+    )
+    add_nodes: List[WorkflowNode] = Field(
+        default_factory=list,
+        description="New nodes to insert into the graph.",
+    )
+    modify_nodes: List[WorkflowNode] = Field(
+        default_factory=list,
+        description=(
+            "Existing nodes with updated fields (matched by id). "
+            "Include ALL fields of the node, not just changed ones."
+        ),
+    )
+    remove_nodes: List[str] = Field(
+        default_factory=list,
+        description="IDs of nodes to delete from the graph.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Intermediate models (pipeline stages)
 # ---------------------------------------------------------------------------
@@ -275,6 +310,7 @@ class GraphState(TypedDict):
     source_text: str
     nodes: Dict[str, Any]
     feedback: str
+    categorized_feedback: Dict[str, str]
     iteration: int
     is_complete: bool
     converter_id: str

@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from sop_to_dag.converter import PipelineConverter
-from sop_to_dag.preprocessing_cache import cached_preprocessing
+from sop_to_dag.preprocessing import cached_preprocessing
 from sop_to_dag.schemas import GraphState
 from sop_to_dag.storage import GraphStore
 

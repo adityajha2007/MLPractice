@@ -4,10 +4,17 @@ LangGraph pipeline (4 nodes):
   START -> agentic_chunk -> build_faiss_index -> enrich_chunks -> resolve_entities -> END
 
 Always runs before conversion. Even short docs benefit from entity resolution.
+
+Includes content-based caching: preprocessing results are keyed by SHA-256 hash
+of the SOP document. The FAISS vector store is not serializable, so it is rebuilt
+from cached chunks on cache hit.
 """
 
+import hashlib
+import json
 import logging
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +93,34 @@ _ENRICHMENT_GRADE_HUMAN = """\
 {retrieved_docs}
 
 Grade each retrieval. Return a DependencyReview with grades for each document.
+"""
+
+_CONDENSATION_SYSTEM = """\
+You are a Context Condensation Specialist. You receive a chunk of SOP text that
+was retrieved as potentially relevant context for a specific query.
+
+Your job: extract ONLY the information from the retrieved text that is directly
+relevant to the query. Produce a concise 2-4 sentence summary that captures the
+key facts, specific values, team names, system references, or process steps that
+address the query.
+
+Rules:
+1. Do NOT reproduce the full retrieved text — condense it.
+2. Include specific details (codes, thresholds, team names, system names) that
+   are relevant to the query.
+3. If the retrieved text has very little relevance, return a single sentence.
+4. Do NOT add information that is not in the retrieved text.
+"""
+
+_CONDENSATION_HUMAN = """\
+## Query (the dangling reference being resolved)
+{query}
+
+## Retrieved Text
+{retrieved_text}
+
+Condense the retrieved text into a brief context note relevant to the query.
+Return ONLY the condensed text — no preamble.
 """
 
 _ENTITY_RESOLUTION_SYSTEM = """\
@@ -169,11 +204,12 @@ def build_faiss_index(state: RAGPrepState) -> RAGPrepState:
 
 
 def enrich_chunks(state: RAGPrepState) -> RAGPrepState:
-    """Node 3: For each chunk, generate queries, retrieve, grade, synthesize."""
+    """Node 3: For each chunk, generate queries, retrieve, grade, condense."""
     total_chunks = len(state["chunks"])
     logger.info("[PREPROCESSING 3/4] RAG enrichment — processing %d chunks...", total_chunks)
     llm_query = get_model("enrichment")
     llm_grade = get_model("enrichment")
+    llm_condense = get_model("enrichment")
     vector_store = state["vector_store"]
     enriched: List[dict] = []
 
@@ -186,8 +222,8 @@ def enrich_chunks(state: RAGPrepState) -> RAGPrepState:
         queries = _generate_queries(llm_query, chunk_id, chunk_text)
         logger.info("    %d queries generated", len(queries))
 
-        # Step 2 + 3: Retrieve and grade
-        valid_context_parts: List[str] = []
+        # Step 2 + 3 + 4: Retrieve, grade, and condense
+        condensed_notes: List[str] = []
         query_texts: List[str] = []
 
         for dep in queries:
@@ -206,22 +242,30 @@ def enrich_chunks(state: RAGPrepState) -> RAGPrepState:
 
             # Grade retrievals
             graded = _grade_retrievals(llm_grade, dep.query, docs)
-            accepted = sum(1 for g in graded if g)
+            accepted_docs = [doc for doc, grade in zip(docs, graded) if grade]
             logger.info("    Query '%s': %d/%d retrievals accepted",
-                         dep.query[:60], accepted, len(docs))
-            for doc, grade in zip(docs, graded):
-                if grade:
-                    valid_context_parts.append(doc.page_content)
+                         dep.query[:60], len(accepted_docs), len(docs))
+
+            if not accepted_docs:
+                continue
+
+            # Condense accepted retrievals into a brief context note
+            combined_text = "\n\n".join(doc.page_content for doc in accepted_docs)
+            note = _condense_context(llm_condense, dep.query, combined_text)
+            if note:
+                condensed_notes.append(note)
+                logger.info("    Condensed context: %d chars -> %d chars",
+                             len(combined_text), len(note))
 
         enriched_chunk = EnrichedChunk(
             chunk_id=chunk_id,
             chunk_text=chunk_text,
-            retrieved_context="\n\n".join(valid_context_parts),
+            retrieved_context="\n\n".join(condensed_notes),
             generated_queries=query_texts,
         )
         enriched.append(enriched_chunk.model_dump())
         ctx_len = len(enriched_chunk.retrieved_context)
-        logger.info("    Chunk %d enriched: %d chars of retrieved context", chunk_id, ctx_len)
+        logger.info("    Chunk %d enriched: %d chars of condensed context", chunk_id, ctx_len)
 
     state["enriched_chunks"] = enriched
     logger.info("  Enrichment complete: %d chunks processed", len(enriched))
@@ -317,6 +361,24 @@ def _grade_retrievals(llm, query: str, docs) -> List[bool]:
         return [False] * len(docs)
 
 
+def _condense_context(llm, query: str, retrieved_text: str) -> str:
+    """Condense retrieved chunk text into a brief relevance note."""
+    messages = [
+        SystemMessage(content=_CONDENSATION_SYSTEM),
+        HumanMessage(
+            content=_CONDENSATION_HUMAN.format(
+                query=query, retrieved_text=retrieved_text
+            )
+        ),
+    ]
+    try:
+        response = llm.invoke(messages)
+        return response.content.strip()
+    except Exception as e:
+        logger.warning("Context condensation failed for query '%s': %s", query[:60], e)
+        return ""
+
+
 def _apply_entity_map(text: str, mappings: List[dict]) -> str:
     """Replace all alias occurrences with canonical forms."""
     for mapping in mappings:
@@ -366,3 +428,120 @@ def run_preprocessing(document: str) -> RAGPrepState:
     graph = _build_preprocessing_graph()
     app = graph.compile()
     return app.invoke(initial_state)
+
+
+# ---------------------------------------------------------------------------
+# Content-based caching
+# ---------------------------------------------------------------------------
+
+DEFAULT_CACHE_DIR = Path("output/preprocessing_cache")
+
+
+def _content_hash(text: str) -> str:
+    """SHA-256 hash of document content (first 16 hex chars for filename)."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _cache_path(cache_dir: Path, content_hash: str) -> Path:
+    return cache_dir / f"{content_hash}.json"
+
+
+def save_to_cache(
+    prep_state: RAGPrepState,
+    source_text: str,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
+) -> Path:
+    """Persist preprocessing results to the content-based cache."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    h = _content_hash(source_text)
+    path = _cache_path(cache_dir, h)
+
+    data = {
+        "content_hash": h,
+        "chunks": prep_state["chunks"],
+        "enriched_chunks": prep_state["enriched_chunks"],
+        "entity_map": prep_state["entity_map"],
+    }
+    path.write_text(json.dumps(data, indent=2))
+    logger.info("[PREP CACHE] Saved: %s", path)
+    return path
+
+
+def load_from_cache(
+    source_text: str,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
+) -> Optional[dict]:
+    """Load cached preprocessing results if they exist.
+
+    Returns a dict with chunks, enriched_chunks, entity_map, and
+    vector_store=None (caller must rebuild if needed). Returns None on miss.
+    """
+    h = _content_hash(source_text)
+    path = _cache_path(cache_dir, h)
+
+    if not path.exists():
+        return None
+
+    data = json.loads(path.read_text())
+
+    # Validate hash matches (guard against manual file edits)
+    if data.get("content_hash") != h:
+        logger.warning("[PREP CACHE] Hash mismatch in %s — ignoring", path)
+        return None
+
+    logger.info("[PREP CACHE] Hit: %s", path)
+    return {
+        "chunks": data["chunks"],
+        "enriched_chunks": data["enriched_chunks"],
+        "entity_map": data["entity_map"],
+        "vector_store": None,
+    }
+
+
+def rebuild_vector_store(prep_state: dict) -> None:
+    """Rebuild the FAISS vector store from cached chunks (in-place).
+
+    Modifies prep_state["vector_store"] directly.
+    """
+    from langchain_community.vectorstores import FAISS
+
+    chunks = prep_state.get("chunks", [])
+    if not chunks:
+        return
+
+    texts = [c["text"] for c in chunks]
+    metadatas = [{"chunk_id": c["chunk_id"], "title": c["title"]} for c in chunks]
+    embeddings = get_embeddings()
+    prep_state["vector_store"] = FAISS.from_texts(texts, embeddings, metadatas=metadatas)
+    logger.info("[PREP CACHE] Rebuilt FAISS vector store from %d chunks", len(chunks))
+
+
+def cached_preprocessing(
+    source_text: str,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
+    force: bool = False,
+    rebuild_faiss: bool = True,
+) -> RAGPrepState:
+    """Run preprocessing with content-based caching.
+
+    Args:
+        source_text: Raw SOP document text.
+        cache_dir: Directory for cache files.
+        force: If True, bypass cache and re-run preprocessing.
+        rebuild_faiss: If True, rebuild FAISS vector store on cache hit.
+
+    Returns:
+        RAGPrepState with all fields populated.
+    """
+    if not force:
+        cached = load_from_cache(source_text, cache_dir)
+        if cached is not None:
+            logger.info("[PREP CACHE] Using cached preprocessing")
+            if rebuild_faiss:
+                rebuild_vector_store(cached)
+            return cached
+
+    logger.info("[PREP CACHE] Cache miss — running preprocessing")
+    prep_state = run_preprocessing(source_text)
+    save_to_cache(prep_state, source_text, cache_dir)
+    return prep_state
