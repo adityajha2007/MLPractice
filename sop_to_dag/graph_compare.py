@@ -29,9 +29,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-base-en-v1.5"
+LLM_MODEL_NAME = "gpt-oss-120b"
 ALIGNMENT_THRESHOLD = 0.70
 SOP_GROUNDING_THRESHOLD = 0.72
 SOP_CHUNK_SIZE = 500  # characters per SOP chunk for FAISS indexing
+TOP_K_CANDIDATES = 10  # embedding candidates per human node for LLM verification
+LLM_BATCH_SIZE = 10  # human nodes per LLM matching call
 
 # Type mapping: human format → normalized
 _HUMAN_TYPE_MAP = {
@@ -166,8 +169,102 @@ def _cosine_similarity_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Semantic node alignment (many-to-one)
+# Step 1: Hybrid node alignment (embeddings + LLM)
 # ---------------------------------------------------------------------------
+
+_MATCH_SYSTEM = """\
+You are a Workflow Graph Alignment Specialist. You match nodes between two \
+workflow graphs that represent the same SOP process.
+
+You receive a batch of HUMAN nodes, each with up to {top_k} AUTO node candidates \
+(pre-filtered by text similarity). Your job is to decide which auto nodes \
+genuinely represent the same step as each human node.
+
+MATCHING RULES:
+1. A human node can match MULTIPLE auto nodes (the auto graph may break one \
+   human step into several granular sub-steps).
+2. An auto node can match at most ONE human node.
+3. Match based on MEANING, not wording. "Enter the dispute code" and \
+   "Input the code in the system" are the same step.
+4. Do NOT match nodes that describe different actions, even if they share \
+   some keywords. "Check fraud score" and "Check dispute code" are different.
+5. If none of the candidates match, return an empty list for that human node.
+6. Consider the node type — a decision/question node is unlikely to match \
+   an activity/instruction node unless the text clearly describes the same step.
+
+Return a JSON object mapping each human node ID to a list of matched auto node IDs.
+Example: {{"human_node_1": ["auto_a", "auto_b"], "human_node_2": [], "human_node_3": ["auto_c"]}}
+"""
+
+_MATCH_HUMAN = """\
+## Human Nodes with Auto Candidates
+
+{batch_text}
+
+Return a JSON object mapping each human_id to a list of matched auto_ids. \
+Use only IDs from the candidates provided. Return empty list [] if no match.
+"""
+
+
+def _get_llm():
+    """Return a ChatOpenAI instance for matching."""
+    from langchain_openai import ChatOpenAI
+
+    return ChatOpenAI(model=LLM_MODEL_NAME, temperature=0.0)
+
+
+def _build_candidate_text(
+    human_batch: List[Tuple[str, Dict]],
+    candidates: Dict[str, List[Tuple[str, str, float]]],
+) -> str:
+    """Build the text payload for one LLM matching batch."""
+    parts = []
+    for h_id, h_data in human_batch:
+        cands = candidates.get(h_id, [])
+        part = f"### Human: `{h_id}` ({h_data['type']})\n> {h_data['text']}\n\nCandidates:\n"
+        for a_id, a_text, sim in cands:
+            part += f"  - `{a_id}`: {a_text} (sim={sim:.2f})\n"
+        if not cands:
+            part += "  (no candidates above threshold)\n"
+        parts.append(part)
+    return "\n".join(parts)
+
+
+def _llm_match_batch(
+    llm,
+    human_batch: List[Tuple[str, Dict]],
+    candidates: Dict[str, List[Tuple[str, str, float]]],
+) -> Dict[str, List[str]]:
+    """Send one batch to the LLM and parse the matching result."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    batch_text = _build_candidate_text(human_batch, candidates)
+    messages = [
+        SystemMessage(content=_MATCH_SYSTEM.format(top_k=TOP_K_CANDIDATES)),
+        HumanMessage(content=_MATCH_HUMAN.format(batch_text=batch_text)),
+    ]
+
+    try:
+        response = llm.invoke(messages)
+        content = response.content.strip()
+        # Extract JSON from response (may be wrapped in ```json ... ```)
+        if "```" in content:
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+            content = content.strip()
+        result = json.loads(content)
+        if isinstance(result, dict):
+            return {k: v for k, v in result.items() if isinstance(v, list)}
+    except Exception as e:
+        logger.warning("LLM matching failed for batch: %s — falling back to embedding-only", e)
+
+    # Fallback: use top-1 embedding candidate for each human node
+    fallback = {}
+    for h_id, _ in human_batch:
+        cands = candidates.get(h_id, [])
+        fallback[h_id] = [cands[0][0]] if cands else []
+    return fallback
 
 
 def _align_nodes(
@@ -175,9 +272,12 @@ def _align_nodes(
     human_nodes: Dict[str, Dict],
     threshold: float = ALIGNMENT_THRESHOLD,
 ) -> AlignmentResult:
-    """Semantic many-to-one alignment via cosine similarity.
+    """Hybrid alignment: embeddings for top-K candidates, LLM for final matching.
 
-    A single broad human node can match multiple granular auto nodes.
+    1. Embed all node texts → cosine similarity matrix
+    2. For each human node: pick top-K auto candidates by similarity
+    3. Send batches to LLM for semantic matching
+    4. Build final alignment from LLM decisions
     """
     if not auto_nodes or not human_nodes:
         return AlignmentResult(
@@ -185,41 +285,79 @@ def _align_nodes(
             unmatched_auto=set(auto_nodes.keys()),
         )
 
-    model = _get_embeddings_model()
+    emb_model = _get_embeddings_model()
 
     auto_ids = list(auto_nodes.keys())
     human_ids = list(human_nodes.keys())
     auto_texts = [auto_nodes[nid]["text"] for nid in auto_ids]
     human_texts = [human_nodes[nid]["text"] for nid in human_ids]
 
-    logger.info("Embedding %d auto nodes and %d human nodes...", len(auto_ids), len(human_ids))
-    auto_emb = _embed_texts(model, auto_texts)
-    human_emb = _embed_texts(model, human_texts)
-
+    # Phase 1: Embedding-based candidate selection
+    logger.info("Phase 1: Embedding %d auto + %d human nodes...", len(auto_ids), len(human_ids))
+    auto_emb = _embed_texts(emb_model, auto_texts)
+    human_emb = _embed_texts(emb_model, human_texts)
     sim_matrix = _cosine_similarity_matrix(auto_emb, human_emb)
-    # sim_matrix[i][j] = similarity between auto_ids[i] and human_ids[j]
 
+    # For each human node, get top-K auto candidates
+    candidates: Dict[str, List[Tuple[str, str, float]]] = {}
+    for j, h_id in enumerate(human_ids):
+        sims = [(auto_ids[i], auto_nodes[auto_ids[i]]["text"], float(sim_matrix[i][j]))
+                for i in range(len(auto_ids))]
+        sims.sort(key=lambda x: x[2], reverse=True)
+        candidates[h_id] = sims[:TOP_K_CANDIDATES]
+
+    logger.info("Phase 1 complete: top-%d candidates per human node", TOP_K_CANDIDATES)
+
+    # Phase 2: LLM-based matching in batches
+    logger.info("Phase 2: LLM matching in batches of %d...", LLM_BATCH_SIZE)
+    llm = _get_llm()
+
+    human_items = [(h_id, human_nodes[h_id]) for h_id in human_ids]
+    all_matches: Dict[str, List[str]] = {}
+
+    for batch_start in range(0, len(human_items), LLM_BATCH_SIZE):
+        batch = human_items[batch_start:batch_start + LLM_BATCH_SIZE]
+        batch_num = batch_start // LLM_BATCH_SIZE + 1
+        total_batches = (len(human_items) + LLM_BATCH_SIZE - 1) // LLM_BATCH_SIZE
+        logger.info("  Batch %d/%d (%d human nodes)...", batch_num, total_batches, len(batch))
+
+        batch_result = _llm_match_batch(llm, batch, candidates)
+        all_matches.update(batch_result)
+
+    # Phase 3: Build AlignmentResult from LLM matches
+    logger.info("Phase 3: Building alignment from LLM results...")
     result = AlignmentResult()
 
-    # For each human node: find ALL auto nodes above threshold
-    for j, h_id in enumerate(human_ids):
-        matches = []
-        for i, a_id in enumerate(auto_ids):
-            if sim_matrix[i][j] >= threshold:
-                matches.append((a_id, float(sim_matrix[i][j])))
-        if matches:
-            matches.sort(key=lambda x: x[1], reverse=True)
-            result.human_to_auto[h_id] = matches
+    # Get embedding similarity for matched pairs (for reporting)
+    auto_idx = {a_id: i for i, a_id in enumerate(auto_ids)}
+    human_idx = {h_id: j for j, h_id in enumerate(human_ids)}
+
+    for h_id in human_ids:
+        matched_auto_ids = all_matches.get(h_id, [])
+        # Filter to valid auto IDs
+        matched_auto_ids = [a_id for a_id in matched_auto_ids if a_id in auto_nodes]
+        if matched_auto_ids:
+            pairs = []
+            for a_id in matched_auto_ids:
+                sim = float(sim_matrix[auto_idx[a_id]][human_idx[h_id]])
+                pairs.append((a_id, sim))
+            pairs.sort(key=lambda x: x[1], reverse=True)
+            result.human_to_auto[h_id] = pairs
             result.covered_human.add(h_id)
         else:
             result.unmatched_human.add(h_id)
 
-    # For each auto node: find best human node above threshold
-    for i, a_id in enumerate(auto_ids):
-        best_j = int(np.argmax(sim_matrix[i]))
-        best_sim = float(sim_matrix[i][best_j])
-        if best_sim >= threshold:
-            result.auto_to_human[a_id] = (human_ids[best_j], best_sim)
+    # Build auto_to_human (best human match for each auto node)
+    for a_id in auto_ids:
+        best_h_id = None
+        best_sim = -1.0
+        for h_id, pairs in result.human_to_auto.items():
+            for matched_a_id, sim in pairs:
+                if matched_a_id == a_id and sim > best_sim:
+                    best_h_id = h_id
+                    best_sim = sim
+        if best_h_id is not None:
+            result.auto_to_human[a_id] = (best_h_id, best_sim)
             result.grounded_auto.add(a_id)
         else:
             result.unmatched_auto.add(a_id)
