@@ -2,9 +2,9 @@
 
 Consolidates all graph-level operations into one module:
   - Topological checks (pure Python)
-  - LLM-based quality checks (completeness, context, granularity)
+  - LLM-based quality checks (completeness, context)
   - Analysis orchestrator
-  - Triplet verification, granularity expansion, error resolution
+  - Triplet verification, error resolution
   - Schema validation (deterministic)
   - Refinement orchestrator
   - LangGraph self-refinement loop
@@ -72,16 +72,36 @@ class _TripletVerification(BaseModel):
 # ===========================================================================
 
 _COMPLETENESS_SYSTEM = """\
-You are a Process Quality Auditor. Your job is to verify that a workflow graph
-completely and accurately represents all steps in the original SOP text.
+You are a Process Quality Auditor performing a section-by-section completeness \
+audit of a workflow graph against the original SOP.
 
-Compare the graph (provided as an adjacency map) against the original SOP.
-Identify:
-1. Steps in the SOP that are MISSING from the graph
-2. Decision branches that are incomplete (e.g., only Yes branch, no No branch)
-3. Any significant information loss
+PROCESS — follow these steps exactly:
 
-Be precise — cite specific SOP text that is not represented.
+1. Break the SOP into its natural sections/steps (numbered items, paragraphs, \
+   bullet points, sub-procedures).
+2. For EACH section, find the graph node(s) that cover it:
+   - If covered: list the node ID(s) and mark status="covered"
+   - If missing: mark status="missing" and describe the gap in gap_description
+3. Pay special attention to:
+   - Decision branches: every "if/then/else" must have BOTH paths in the graph
+   - Error/exception paths mentioned in the SOP
+   - Specific data values, thresholds, or conditions
+4. Set is_complete=true ONLY if every section is "covered"
+5. Populate missing_branches with one entry per gap (from the "missing" sections)
+
+GRAPH CONVENTIONS — do NOT flag these as gaps:
+- A list of fields to validate/populate may appear as ONE node listing all fields. \
+  This is correct — do not flag individual fields as missing.
+- Multi-way decisions (3+ options) are decomposed into chained binary Yes/No \
+  question nodes. This is correct — do not flag missing multi-option nodes.
+- The graph may contain back-edges (loops) for "retry", "go back to step X", \
+  or "repeat steps N-M". Reusing existing nodes via loops is correct — do not \
+  flag repeated sub-procedures as missing separate nodes.
+- Cross-system data flows (copy from System A, paste into System B) may be \
+  split into separate nodes per system. This is correct.
+
+Be exhaustive — do not skip any SOP section. Every section must appear in your \
+sections list, whether covered or missing.
 """
 
 _COMPLETENESS_HUMAN = """\
@@ -91,7 +111,8 @@ _COMPLETENESS_HUMAN = """\
 ## Current Graph Nodes
 {nodes_compact}
 
-Evaluate completeness. Return RefineFeedback with is_complete and missing_branches.
+Audit every section of the SOP against the graph. Return RefineFeedback with \
+sections (one per SOP step), is_complete, and missing_branches.
 """
 
 _CONTEXT_SYSTEM = """\
@@ -100,11 +121,19 @@ workflow graph are logically adjacent — meaning the flow from one node to the
 next makes sense in the context of the original SOP.
 
 For each edge in the graph, evaluate:
-1. Does the transition make logical sense?
-2. Are there missing intermediate steps?
+1. Does the transition make logical sense given the SOP?
+2. Are there missing intermediate steps that the SOP explicitly describes?
 3. Is the edge direction correct?
 
-Report only genuine issues — do not flag correct transitions.
+IMPORTANT — do NOT flag these as issues:
+- Back-edges (loops): edges pointing to earlier nodes for "retry", "go back", \
+  or "repeat steps" are intentional and correct.
+- Granularity differences: a broad step connecting to a specific sub-step is \
+  fine if the SOP supports it.
+- Multi-node sequences for cross-system data flows (copy from A → paste into B) \
+  are correct even if the SOP describes them in one sentence.
+
+Report only genuine logical flow problems — do not flag correct transitions.
 """
 
 _CONTEXT_HUMAN = """\
@@ -176,13 +205,26 @@ target node as needed.
 - Do NOT touch nodes that are already correct.
 - If no fixes are needed, return empty lists.
 
-Node schema reminder:
+NODE SCHEMA:
 - instruction: must have "next", "options" must be null
-- question: must have "options" (Yes/No), "next" must be null, text ends with "?"
+- question: must have "options" with exactly {{"Yes": "id", "No": "id"}}, \
+"next" must be null, text ends with "?"
 - terminal: "next" and "options" both null
 - reference: must have "next" and "external_ref"
-- All IDs must be snake_case
+- All IDs must be descriptive snake_case (never generic like 'node_1')
 - confidence: "high" = explicit in SOP, "medium" = inferred, "low" = guess
+
+GRAPH CONVENTIONS — you MUST follow these when producing patches:
+- All decisions must be BINARY Yes/No. For multi-way decisions, create a \
+chain of binary question nodes (first checks option A, "No" leads to checking \
+option B, etc.).
+- A list of fields to validate/populate = ONE instruction node listing all \
+fields. Do NOT create a separate node per field.
+- Cross-system data flows (copy from System A, paste into System B) = separate \
+node per system interaction, each with the 'system' field set.
+- Loops are allowed. "Go back to step X" or "retry" = back-edge to existing \
+node. Do NOT duplicate nodes for repeated sub-procedures.
+- Preserve numbered step ordering from the SOP.
 """
 
 _PATCH_RESOLVER_HUMAN = """\
@@ -501,7 +543,7 @@ def check_context(nodes: dict, source_text: str) -> Dict[str, Any]:
 
 
 def analyse(state: GraphState) -> GraphState:
-    """Run topological -> completeness -> context -> granularity checks.
+    """Run topological -> completeness -> context checks.
 
     Mutates and returns the state with updated feedback, analysis_report,
     and is_complete fields.
@@ -585,11 +627,7 @@ def analyse(state: GraphState) -> GraphState:
 
 
 class TripletVerifier:
-    """Verify decision-node triplets against source SOP text.
-
-    Prioritizes low-confidence edges first, then medium. High-confidence
-    edges are skipped unless flagged by topological analysis.
-    """
+    """Verify all decision-node triplets against source SOP text."""
 
     def __init__(self):
         self.llm = get_model("triplet")
@@ -619,10 +657,22 @@ class TripletVerifier:
                 )
         return triplets
 
+    @staticmethod
+    def _triplet_signature(t: Dict[str, str]) -> str:
+        """Unique signature for a triplet (source_id, edge_label, target_id)."""
+        return f"{t['source_id']}|{t['edge_label']}|{t['target_id']}"
+
     def verify(
-        self, nodes: Dict[str, Any], source_text: str
+        self,
+        nodes: Dict[str, Any],
+        source_text: str,
+        skip_signatures: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
         """Verify conditional triplets, prioritizing low-confidence edges.
+
+        Args:
+            skip_signatures: Set of triplet signatures already verified in
+                prior iterations. These are skipped to save LLM calls.
 
         Returns list of invalid triplets with explanations.
         """
@@ -630,21 +680,32 @@ class TripletVerifier:
         if not triplets:
             return []
 
-        # Sort by confidence: low first, then medium, skip high
-        priority_order = {"low": 0, "medium": 1, "high": 2}
-        triplets.sort(key=lambda t: priority_order.get(t.get("confidence", "high"), 2))
+        to_verify = triplets
 
-        # Filter: verify low and medium; skip high unless very few triplets
-        to_verify = [t for t in triplets if t.get("confidence") != "high"]
+        # Skip triplets already verified in prior iterations
+        if skip_signatures:
+            before = len(to_verify)
+            to_verify = [
+                t for t in to_verify
+                if self._triplet_signature(t) not in skip_signatures
+            ]
+            skipped = before - len(to_verify)
+            if skipped:
+                logger.info("    Skipped %d already-verified triplets", skipped)
+
         if not to_verify:
-            # All high confidence — verify all as fallback
-            to_verify = triplets
+            return []
 
         invalid_triplets = []
         for i in range(0, len(to_verify), BATCH_SIZE):
             batch = to_verify[i : i + BATCH_SIZE]
             batch_results = self._verify_batch(batch, source_text)
             invalid_triplets.extend(batch_results)
+
+        # Mark all verified triplets (both valid and invalid) as done
+        if skip_signatures is not None:
+            for t in to_verify:
+                skip_signatures.add(self._triplet_signature(t))
 
         return invalid_triplets
 
@@ -916,12 +977,14 @@ def refine(state: GraphState) -> GraphState:
     """Issue-by-issue refinement: each analyser issue gets its own resolver call.
 
     Order:
-      1. Triplet verification → collect invalid triplets as individual issues
-      2. LLM-based categories (completeness, context, triplets) — one resolver
-         call per issue line, so nothing gets skipped
-      3. Fresh topological scan — catches structural issues introduced by
+      1. Resolve completeness issues (add missing SOP content)
+      2. Resolve context issues (fix adjacency problems)
+      3. Triplet verification on ALL decision edges (catches bad edges
+         from original graph AND from resolver patches in steps 1-2)
+      4. Resolve invalid triplets
+      5. Fresh topological scan — catches structural issues introduced by
          the LLM patches above
-      4. Schema validation (deterministic)
+      6. Schema validation (deterministic)
 
     Mutates and returns the state with updated nodes and incremented iteration.
     """
@@ -934,40 +997,38 @@ def refine(state: GraphState) -> GraphState:
         k: list(v) for k, v in state.get("categorized_feedback", {}).items()
     }
 
-    triplet_verifier = TripletVerifier()
+    # Track previously resolved issues and verified triplets for deduplication
+    resolved_issues: set = set(state.get("resolved_issues", []))
+    verified_triplets: set = set(state.get("verified_triplets", []))
+
     patch_resolver = GraphPatchResolver()
     schema_validator = SchemaValidator()
-
-    # 1. Triplet verification — add as its own category
-    logger.info("  [REFINER iter %d] Step 1: Triplet verification...", iteration)
-    invalid_triplets = triplet_verifier.verify(nodes, source_text)
-    logger.info("    %d invalid triplets found", len(invalid_triplets))
-    for t in invalid_triplets:
-        logger.info("    INVALID: %s --(%s)--> %s: %s",
-                     t["source_id"], t["edge_label"], t["target_id"],
-                     t.get("explanation", "")[:100])
-
-    if invalid_triplets:
-        categorized_feedback["triplets"] = [
-            f"{t['source_id']} --({t['edge_label']})--> "
-            f"{t['target_id']}: {t['explanation']}"
-            for t in invalid_triplets
-        ]
-
-    # 2. LLM-based categories — one resolver call per issue
-    llm_categories = ["completeness", "context", "triplets"]
     total_issues = 0
 
-    for category in llm_categories:
+    # 1-2. Resolve completeness and context issues (content-adding steps first)
+    content_categories = ["completeness", "context"]
+
+    for category in content_categories:
         issues = categorized_feedback.get(category, [])
         if not issues:
             continue
-        logger.info(
-            "  [REFINER iter %d] Category '%s': %d issues",
-            iteration, category, len(issues),
-        )
-        for i, issue in enumerate(issues):
-            logger.info("    [%s %d/%d] %s", category, i + 1, len(issues), issue[:120])
+
+        # Filter out issues that were already resolved in a prior iteration
+        new_issues = [iss for iss in issues if iss not in resolved_issues]
+        skipped = len(issues) - len(new_issues)
+        if skipped:
+            logger.info(
+                "  [REFINER iter %d] Category '%s': %d issues (%d skipped as already resolved)",
+                iteration, category, len(new_issues), skipped,
+            )
+        else:
+            logger.info(
+                "  [REFINER iter %d] Category '%s': %d issues",
+                iteration, category, len(new_issues),
+            )
+
+        for i, issue in enumerate(new_issues):
+            logger.info("    [%s %d/%d] %s", category, i + 1, len(new_issues), issue[:120])
             nodes_before = len(nodes)
             nodes, patch = patch_resolver.resolve(nodes, issue, source_text)
             changes = (
@@ -977,10 +1038,50 @@ def refine(state: GraphState) -> GraphState:
                 "      Nodes: %d -> %d (changes: %d)",
                 nodes_before, len(nodes), changes,
             )
+            # Mark this issue as resolved so it's not re-processed
+            resolved_issues.add(issue)
             total_issues += 1
 
-    # 3. Fresh topological scan — catches issues introduced by LLM patches
-    logger.info("  [REFINER iter %d] Step 3: Fresh topological scan...", iteration)
+    # 3. Triplet verification — runs AFTER content patches so newly added
+    #    decision edges are also verified
+    logger.info("  [REFINER iter %d] Step 3: Triplet verification...", iteration)
+    triplet_verifier = TripletVerifier()
+    invalid_triplets = triplet_verifier.verify(
+        nodes, source_text, skip_signatures=verified_triplets,
+    )
+    logger.info("    %d invalid triplets found", len(invalid_triplets))
+    for t in invalid_triplets:
+        logger.info("    INVALID: %s --(%s)--> %s: %s",
+                     t["source_id"], t["edge_label"], t["target_id"],
+                     t.get("explanation", "")[:100])
+
+    # 4. Resolve invalid triplets
+    if invalid_triplets:
+        triplet_issues = [
+            f"{t['source_id']} --({t['edge_label']})--> "
+            f"{t['target_id']}: {t['explanation']}"
+            for t in invalid_triplets
+        ]
+        logger.info(
+            "  [REFINER iter %d] Category 'triplets': %d issues",
+            iteration, len(triplet_issues),
+        )
+        for i, issue in enumerate(triplet_issues):
+            logger.info("    [triplets %d/%d] %s", i + 1, len(triplet_issues), issue[:120])
+            nodes_before = len(nodes)
+            nodes, patch = patch_resolver.resolve(nodes, issue, source_text)
+            changes = (
+                len(patch.add_nodes) + len(patch.modify_nodes) + len(patch.remove_nodes)
+            )
+            logger.info(
+                "      Nodes: %d -> %d (changes: %d)",
+                nodes_before, len(nodes), changes,
+            )
+            resolved_issues.add(issue)
+            total_issues += 1
+
+    # 5. Fresh topological scan — catches issues introduced by LLM patches
+    logger.info("  [REFINER iter %d] Step 5: Fresh topological scan...", iteration)
     topo_report = get_graph_issues(nodes)
     if topo_report != "Topology Valid.":
         topo_lines = [line.strip() for line in topo_report.split("\n") if line.strip()]
@@ -994,8 +1095,8 @@ def refine(state: GraphState) -> GraphState:
     else:
         logger.info("    Topology: VALID")
 
-    # 4. Schema validation (deterministic fixes)
-    logger.info("  [REFINER iter %d] Step 4: Schema validation...", iteration)
+    # 6. Schema validation (deterministic fixes)
+    logger.info("  [REFINER iter %d] Step 6: Schema validation...", iteration)
     nodes, fix_msgs = schema_validator.validate_and_fix(nodes)
     if fix_msgs:
         for msg in fix_msgs:
@@ -1005,6 +1106,8 @@ def refine(state: GraphState) -> GraphState:
 
     state["nodes"] = nodes
     state["iteration"] = iteration
+    state["resolved_issues"] = list(resolved_issues)
+    state["verified_triplets"] = list(verified_triplets)
     if fix_msgs:
         state["feedback"] = (
             state.get("feedback", "") + "\nSchema fixes: " + "; ".join(fix_msgs)
@@ -1021,7 +1124,7 @@ def refine(state: GraphState) -> GraphState:
 # LangGraph self-refinement loop
 # ===========================================================================
 
-MAX_ITERATIONS = 10
+MAX_ITERATIONS = 15
 
 
 def _dump_iteration(dump_dir: Path, iteration: int, state: GraphState) -> None:

@@ -1,4 +1,4 @@
-"""SOP-to-DAG pipeline converter (v4 — graph-first).
+"""SOP-to-graph pipeline converter (v4 — graph-first).
 
 Step 1 (Graph Gen):     LLM converts full enriched SOP -> graph JSON directly
 Step 2 (Graph Refine):  For each chunk, LLM produces a patch to add/modify/remove nodes
@@ -28,68 +28,136 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _GRAPH_SYSTEM = """\
-You are a Process Logic Engineer. Convert an SOP document directly into a \
-workflow DAG (directed acyclic graph) represented as a list of nodes.
+You are a Senior Process Architect. Convert the provided procedural text into \
+a precise JSON Workflow Graph.
 
-Each node must follow this EXACT schema:
-{
-  "id": "snake_case_id",          // 2-4 word snake_case identifier
-  "type": "<type>",               // One of: "instruction", "question", "terminal", "reference"
-  "text": "Description",          // Self-explanatory action or question text
-  "next": "next_node_id" | null,  // For instruction/reference: ID of next node. Null for question/terminal.
-  "options": {"Yes": "id", "No": "id"} | null,  // For question nodes ONLY. Null otherwise.
-  "external_ref": "Doc Name" | null,  // For reference nodes: name of external document
-  "role": "Role Name" | null,     // Who performs this action (if specified in SOP)
-  "system": "System Name" | null, // Software or tool used (if specified in SOP)
-  "confidence": "high"            // "high" = explicit in SOP, "medium" = inferred, "low" = guess
-}
+### 1. NODE IDENTITY & STRUCTURE
+- **IDs**: You MUST use descriptive, snake_case IDs (e.g., 'check_fraud_score', \
+'update_case_status'). NEVER use generic IDs like 'node_1', 'step_2'.
+- **Granularity**: Break complex steps into single logical units. "Open System X, \
+navigate to Tab Y, click Z" = 3 separate nodes, not 1.
+- **Strict Connectivity**: Every 'next' or option value must match exactly one \
+'id' present in your output list.
+- **Loops allowed**: The graph may contain cycles. If the SOP says "go back to \
+step X", "retry", or "repeat", point 'next' or an option back to the earlier \
+node ID. Do NOT avoid back-edges.
 
-NODE TYPE RULES:
-- "instruction": A sequential action step. MUST have "next" pointing to another node ID.
-- "question": A decision point. MUST have "options" with Yes/No keys. "next" must be null.
-  Question text MUST end with "?".
-- "terminal": End of a process path. "next" and "options" must both be null.
-- "reference": Like instruction but links to an external document. MUST have "next" and "external_ref".
+### 2. NODE TYPES & SCHEMA RULES
+Your output must strictly adhere to these types:
 
-STRUCTURE RULES:
-1. The FIRST node must have id="start".
-2. There must be at least one terminal node (typically id="end").
-3. Every instruction/reference node must have "next" pointing to a valid node ID.
-4. Every question node must have "options" with at least "Yes" and "No" keys.
-5. All node IDs referenced in "next" or "options" must exist as node IDs in your output.
-6. After a decision where both branches converge, both branches' last nodes should \
-point to the same convergence node.
+* **"question"**
+  * Use for decision points. All decisions MUST be binary Yes/No.
+  * **REQUIRED**: 'options' with exactly two keys: {{"Yes": "id", "No": "id"}}.
+  * **Constraint**: Do NOT use the 'next' field for questions. It must be null.
+  * **Constraint**: Question text MUST end with "?".
+  * **Multi-way decisions**: If the SOP has 3+ options, decompose into a chain of \
+binary Yes/No questions. See the PATTERN GUIDE in the input for examples.
 
-CONTENT RULES:
-1. Capture MAXIMUM detail — every specific click, check, data entry, decision point, \
-and cross-section dependency mentioned in the SOP. Do NOT summarize or collapse \
-multiple actions into one node. Each distinct action gets its own node.
-2. Include role and system metadata when the SOP specifies who does what and in which tool.
-3. Cross-section references should use type="reference" with the document name in external_ref.
-4. Set confidence to "medium" when inferring a connection not explicitly stated, \
-"low" when guessing to maintain connectivity.
+* **"instruction"**
+  * Use for linear steps or actions.
+  * **REQUIRED**: 'next' field containing exactly **one** string ID.
+  * **Constraint**: Never use lists or pipe-separated strings in 'next'.
 
-EXAMPLE (simple decision flow):
-Input: "Open the case. If fraud detected, escalate to supervisor. Otherwise, close the case."
-Output nodes:
-[
-  {"id": "start", "type": "instruction", "text": "Open the case", "next": "is_fraud_detected_question", "options": null, "external_ref": null, "role": null, "system": null, "confidence": "high"},
-  {"id": "is_fraud_detected_question", "type": "question", "text": "Is fraud detected?", "next": null, "options": {"Yes": "escalate_to_supervisor", "No": "close_the_case"}, "external_ref": null, "role": null, "system": null, "confidence": "high"},
-  {"id": "escalate_to_supervisor", "type": "instruction", "text": "Escalate case to supervisor", "next": "end", "options": null, "external_ref": null, "role": null, "system": null, "confidence": "high"},
-  {"id": "close_the_case", "type": "instruction", "text": "Close the case", "next": "end", "options": null, "external_ref": null, "role": null, "system": null, "confidence": "high"},
-  {"id": "end", "type": "terminal", "text": "End of procedure.", "next": null, "options": null, "external_ref": null, "role": null, "system": null, "confidence": "high"}
-]
+* **"terminal"**
+  * Use for the absolute end of a flow or a hand-off to a different department.
+  * **Constraint**: 'next' and 'options' should be null.
 
-EXAMPLE (reference node):
-{"id": "refer_fraud_guide", "type": "reference", "text": "Refer to Fraud Resolution Guide for escalation procedures", "next": "next_step_id", "options": null, "external_ref": "Fraud Resolution Guide", "role": "Analyst", "system": null, "confidence": "high"}
+* **"reference"**
+  * Use for static data lookups (e.g., "See Response Codes Table").
+  * **REQUIRED**: 'next' field pointing to where the flow resumes after lookup.
+  * **REQUIRED**: 'external_ref' field with the document/table name.
+
+### 3. STRUCTURE RULES
+- First node must have id="start". At least one terminal node (typically id="end").
+- After a decision where branches converge, both branches' last nodes point to \
+the same convergence node.
+- If the text mentions an external guide, use type="reference" with 'external_ref'.
+- Preserve numbered step ordering. Do NOT reorder or skip steps.
+
+### 4. METADATA
+- **role**: Who performs this action (if specified in SOP).
+- **system**: Software or tool used (if specified in SOP).
+- **confidence**: "high" = stated in SOP, "medium" = inferred, "low" = guess.
+
+### 5. CONTENT DETAIL & GRANULARITY
+- Capture MAXIMUM detail — every click, check, data entry, decision point, \
+field name, code, threshold, and cross-section dependency.
+- Do NOT summarize or collapse multiple actions into one node.
+- **Split**: Sequential actions, system interactions, decisions = separate nodes.
+- **Keep as one**: A list of fields to validate/populate = one node listing all fields.
+- When copying data between systems, each system interaction = separate node.
+- Email/escalation actions: capture full template (recipients, subject, body).
+
+### 6. LOOPS & REPEATED PROCEDURES
+- "Go back to step X" / "retry" = back-edge to existing node.
+- "Repeat steps N-M for another section" = back-edge to first node of that \
+sequence. Do NOT duplicate nodes for repeated sub-procedures.
 
 In your reasoning field, provide a detailed analysis of the SOP structure: \
 identify all decision points, branches, convergence points, cross-section \
 dependencies, and the overall process flow before producing the nodes.
 """
 
+_GRAPH_PATTERN_GUIDE = """\
+## PATTERN GUIDE — follow these modeling patterns exactly.
+
+### P1. Multi-option → chain of binary Yes/No questions
+SOP: "If dispute code is 103, do X. If 1047, do Y. Otherwise do Z."
+  {{"id": "is_code_103_question", "type": "question", "text": "Is the dispute code 103?", "next": null, "options": {{"Yes": "handle_103", "No": "is_code_1047_question"}}}},
+  {{"id": "is_code_1047_question", "type": "question", "text": "Is the dispute code 1047?", "next": null, "options": {{"Yes": "handle_1047", "No": "handle_other_codes"}}}}
+WRONG: {{"options": {{"103": "...", "1047": "...", "Other": "..."}}}}
+
+### P2. Nested conditionals → chained question nodes
+SOP: "If account is special, check if data auto-populated. If not, populate. Then check for error note."
+  {{"id": "is_special_account_question", "type": "question", "text": "Is the account type special?", "next": null, "options": {{"Yes": "did_data_populate_question", "No": "next_section"}}}},
+  {{"id": "did_data_populate_question", "type": "question", "text": "Did the data auto-populate?", "next": null, "options": {{"Yes": "verify_data", "No": "manually_populate"}}}},
+  {{"id": "manually_populate", "type": "instruction", "text": "Manually populate required fields", "next": "check_error_note_question"}},
+  {{"id": "check_error_note_question", "type": "question", "text": "Is there an error note?", "next": null, "options": {{"Yes": "correct_error", "No": "next_section"}}}}
+
+### P3. Cross-system data flow → separate node per system interaction
+SOP: "Copy the note from System A, paste into System B on Transfer tab."
+  {{"id": "copy_note_system_a", "type": "instruction", "text": "Copy the activity note from System A", "next": "paste_note_system_b", "system": "System A"}},
+  {{"id": "paste_note_system_b", "type": "instruction", "text": "Paste the activity note into System B on the Transfer tab", "next": "next_step", "system": "System B"}}
+
+### P4. Auto-populate / manual fallback → action → question → converge
+SOP: "Click Populate Data. If not populated, escalate. Verify fields."
+  {{"id": "click_populate_data", "type": "instruction", "text": "Click the Populate Data button", "next": "did_data_populate_question", "system": "System A"}},
+  {{"id": "did_data_populate_question", "type": "question", "text": "Did the data auto-populate?", "next": null, "options": {{"Yes": "verify_fields", "No": "escalate_to_supervisor"}}}},
+  {{"id": "escalate_to_supervisor", "type": "instruction", "text": "Escalate to supervisor for manual data population", "next": "verify_fields", "role": "Supervisor"}},
+  {{"id": "verify_fields", "type": "instruction", "text": "Verify all required fields are populated", "next": "next_step"}}
+This pattern may repeat for different tabs/sections — use distinct node IDs each time.
+
+### P5. Field validation list → ONE node listing all fields
+SOP: "Validate: Account Status, Payment Rating, Date of Last Payment, Balance, Days Past Due."
+  {{"id": "validate_required_fields", "type": "instruction", "text": "Validate the following fields: Account Status, Payment Rating, Date of Last Payment, Balance, Days Past Due", "next": "next_step"}}
+WRONG: separate node per field.
+
+### P6. Email/escalation → capture full template
+SOP: "Email docs to team@company.com. Subject: Account # - Docs. Body: Include viewer link."
+  {{"id": "email_docs_to_team", "type": "instruction", "text": "Email documents to team@company.com. Subject: 'Account # - Docs'. Body: 'Include viewer link'", "next": "screenshot_email"}},
+  {{"id": "screenshot_email", "type": "instruction", "text": "Add screenshot of sent email to the case system", "next": "next_step", "system": "Case System"}}
+
+### P7. Retry loop → back-edge
+SOP: "Submit request. If it fails, wait 1 day and retry."
+  {{"id": "submit_request", "type": "instruction", "text": "Submit the request", "next": "did_request_succeed_question"}},
+  {{"id": "did_request_succeed_question", "type": "question", "text": "Did the request succeed?", "next": null, "options": {{"Yes": "next_step", "No": "wait_one_day"}}}},
+  {{"id": "wait_one_day", "type": "instruction", "text": "Wait 1 business day", "next": "submit_request"}}
+
+### P8. Simple decision flow
+SOP: "Open case. If fraud, escalate. Otherwise close."
+  {{"id": "start", "type": "instruction", "text": "Open the case", "next": "is_fraud_detected_question"}},
+  {{"id": "is_fraud_detected_question", "type": "question", "text": "Is fraud detected?", "next": null, "options": {{"Yes": "escalate_to_supervisor", "No": "close_case"}}}},
+  {{"id": "escalate_to_supervisor", "type": "instruction", "text": "Escalate case to supervisor", "next": "end"}},
+  {{"id": "close_case", "type": "instruction", "text": "Close the case", "next": "end"}},
+  {{"id": "end", "type": "terminal", "text": "End of procedure", "next": null, "options": null}}
+"""
+
 _GRAPH_HUMAN = """\
-Convert this SOP into a workflow graph following the schema exactly. \
+{pattern_guide}
+
+---
+
+Convert this SOP into a workflow graph following the schema and patterns above. \
 Capture every detail — do not summarize or skip steps.
 
 {enriched_sop}
@@ -326,6 +394,7 @@ class PipelineConverter:
                 schema=InitialGraph,
                 system=_GRAPH_SYSTEM,
                 human=_GRAPH_HUMAN,
+                pattern_guide=_GRAPH_PATTERN_GUIDE,
                 enriched_sop=enriched_sop,
             )
             nodes = _nodes_list_to_dict(result.nodes)

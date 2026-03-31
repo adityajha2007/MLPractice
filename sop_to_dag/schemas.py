@@ -72,32 +72,35 @@ class ExtractorOutput(BaseModel):
     all_nodes: List[WorkflowNode]
 
 
+class SectionCoverage(BaseModel):
+    """Coverage audit for a single SOP section/step."""
+
+    sop_text: str = Field(description="The SOP step or instruction being checked.")
+    node_ids: List[str] = Field(
+        default_factory=list,
+        description="Graph node IDs that cover this SOP step. Empty if missing.",
+    )
+    status: Literal["covered", "missing"] = Field(
+        description="Whether this SOP step is represented in the graph.",
+    )
+    gap_description: str = Field(
+        default="",
+        description="If missing: what specifically is not represented. Empty if covered.",
+    )
+
+
 class RefineFeedback(BaseModel):
-    """Feedback from the analyser about graph completeness."""
+    """Section-by-section completeness audit of the graph against the SOP."""
 
-    is_complete: bool
+    sections: List[SectionCoverage] = Field(
+        description="One entry per SOP section/step, showing coverage status.",
+    )
+    is_complete: bool = Field(
+        description="True only if every section has status='covered'.",
+    )
     missing_branches: List[str] = Field(
-        description="List of specific 'If X then Y' rules missing from the graph."
+        description="List of specific missing items — one per gap found.",
     )
-
-
-class CoarseNode(BaseModel):
-    """A graph node flagged as too coarse — collapses multiple actions."""
-
-    node_id: str = Field(description="ID of the node that is too coarse.")
-    reason: str = Field(description="Why this node needs expansion.")
-    suggested_split: int = Field(
-        description="Suggested number of sub-steps this node should become."
-    )
-
-
-class GranularityFeedback(BaseModel):
-    """Feedback from the analyser about node-level granularity."""
-
-    is_granular: bool = Field(
-        description="Whether all nodes are sufficiently granular."
-    )
-    coarse_nodes: List[CoarseNode] = Field(default_factory=list)
 
 
 class InitialGraph(BaseModel):
@@ -318,6 +321,8 @@ class GraphState(TypedDict):
     enriched_chunks: List[dict]
     vector_store: Any
     entity_map: List[dict]
+    resolved_issues: List[str]
+    verified_triplets: List[str]
 
 
 class RAGPrepState(TypedDict):

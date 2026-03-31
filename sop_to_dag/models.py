@@ -59,8 +59,15 @@ class LLMStopError(Exception):
         super().__init__(f"HTTP {status_code}: {message}")
 
 
+_RETRY_WAIT = 500  # seconds to wait before retrying on rate limit / server error
+_MAX_RETRIES = 2   # retry up to 2 times (3 total attempts) before halting
+
+
 def safe_invoke(llm_or_structured, messages, *, context: str = ""):
-    """Call llm.invoke(messages) and halt on non-200 API responses.
+    """Call llm.invoke(messages) with auto-retry on rate limits and server errors.
+
+    On 429 (rate limit) or 5xx (server error): waits 500s then retries, up to
+    2 retries (3 total attempts). On 401/403 (auth): halts immediately.
 
     Args:
         llm_or_structured: A ChatOpenAI or structured-output LLM instance.
@@ -71,23 +78,46 @@ def safe_invoke(llm_or_structured, messages, *, context: str = ""):
         The LLM response (AIMessage or Pydantic model for structured output).
 
     Raises:
-        LLMStopError: On rate-limit (429), server error (5xx), or auth error (401/403).
-            The pipeline should stop and resume from checkpoint.
+        LLMStopError: After all retries exhausted, or on auth errors (401/403).
     """
-    try:
-        return llm_or_structured.invoke(messages)
-    except Exception as e:
-        status = _extract_status_code(e)
-        if status and status != 200:
-            label = f" [{context}]" if context else ""
-            logger.error(
-                "LLM call failed%s with HTTP %d: %s. "
-                "Pipeline stopped — resume from last checkpoint once resolved.",
-                label, status, e,
-            )
-            raise LLMStopError(status, str(e)) from e
-        # Non-HTTP errors (parsing, network timeout, etc.) — re-raise as-is
-        raise
+    label = f" [{context}]" if context else ""
+
+    for attempt in range(1, _MAX_RETRIES + 2):  # 1, 2, 3
+        try:
+            return llm_or_structured.invoke(messages)
+        except Exception as e:
+            status = _extract_status_code(e)
+
+            # Auth errors — no point retrying
+            if status in (401, 403):
+                logger.error(
+                    "LLM call failed%s with HTTP %d: %s. "
+                    "Pipeline stopped — fix credentials and resume from checkpoint.",
+                    label, status, e,
+                )
+                raise LLMStopError(status, str(e)) from e
+
+            # Rate limit or server error — retry with wait
+            if status and status != 200:
+                if attempt <= _MAX_RETRIES:
+                    logger.warning(
+                        "LLM call failed%s with HTTP %d (attempt %d/%d). "
+                        "Waiting %ds before retry...",
+                        label, status, attempt, _MAX_RETRIES + 1, _RETRY_WAIT,
+                    )
+                    import time
+                    time.sleep(_RETRY_WAIT)
+                    continue
+                else:
+                    logger.error(
+                        "LLM call failed%s with HTTP %d after %d attempts. "
+                        "Pipeline stopped — resume from checkpoint once resolved.",
+                        label, status, attempt,
+                    )
+                    raise LLMStopError(status, str(e)) from e
+
+            # Non-HTTP errors (parsing, network timeout, etc.) — re-raise as-is
+            raise
 
 
 def _extract_status_code(exc: Exception) -> int | None:
